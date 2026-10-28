@@ -1,0 +1,23 @@
+[package]
+name = "capkey"
+description = "Spending-policy vaults for AI agents on NEAR"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+near-sdk = "5.29"
+
+[dev-dependencies]
+near-sdk = { version = "5.29", features = ["unit-testing"] }
+
+[profile.release]
+codegen-units = 1
+opt-level = "s"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
