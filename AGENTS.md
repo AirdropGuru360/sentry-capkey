@@ -10,9 +10,9 @@ Tracks: security (main), agents, defi.
 - **Sentry** (to build): a Telegram bot (@SentryCapkeyBot) where the owner asks the agent to pay. Flow: parse request -> risk check -> confirmation -> pay through the vault -> report result. Later: cross-chain payout through NEAR Intents 1Click, and a small fee.
 
 ## Fixed facts (public, testnet)
-- Vault contract: `vault.wavecapkey.testnet` (teammate's contract)
+- Vault contract: `vault2.wavecapkey.testnet` (teammate's contract)
 - Owner account: `dave-owner.testnet`
-- Agent account: `dave-sentry-agent.testnet` (holds ONLY a function call key for `execute_payment`)
+- Agent account: `dave-agent2.testnet` (holds ONLY a function call key for `execute_payment`)
 - Approved recipient for tests: `shop.wavecapkey.testnet`
 - Amounts are yoctoNEAR strings (1 NEAR = 10^24). Never use JavaScript floats for money; use BigInt.
 
@@ -25,7 +25,7 @@ Tracks: security (main), agents, defi.
 6. **Always ask for confirmation** ("Pay X to Y? Reply confirm") before any payment. Never auto-execute.
 7. **Idempotency:** one unique ID per request, stored locally, so a retry never pays twice.
 8. The vault enforces the rules on-chain. Do not re-implement or weaken them in the bot. The bot adds checks, never removes them.
-9. Do not call `set_policy` per payout: it replaces the whole policy AND resets the daily window. We are waiting for an owner-only `add_recipient` method from the teammate.
+9. Do not call `set_policy` per payout: it replaces the whole policy AND resets the daily window. Use the owner-only `approve_once`, `add_recipient` and `remove_recipient` methods instead (they do not reset the daily window).
 10. Verify package names, endpoints and versions in the official docs before installing or using them. Do not guess. If unsure, say so.
 
 ## Stack

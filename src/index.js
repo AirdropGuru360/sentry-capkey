@@ -4,6 +4,8 @@
 
 import { Telegraf } from "telegraf";
 import { isOwner, parseOwnerId } from "./owner.js";
+import { getVault } from "./vault.js";
+import { formatNear } from "./format.js";
 
 function readEnv(name) {
   const value = process.env[name];
@@ -28,6 +30,13 @@ if (botToken === "") {
   process.exit(1);
 }
 
+const vaultId = readEnv("VAULT_CONTRACT_ID");
+const ownerAccount = readEnv("OWNER_ACCOUNT_ID");
+if (vaultId === "" || ownerAccount === "") {
+  console.error("Sentry cannot start: VAULT_CONTRACT_ID or OWNER_ACCOUNT_ID is empty.");
+  process.exit(1);
+}
+
 console.log("Sentry starting");
 
 const bot = new Telegraf(botToken);
@@ -44,6 +53,34 @@ bot.use((ctx, next) => {
 });
 
 bot.start((ctx) => ctx.reply("Sentry online"));
+
+bot.command("status", async (ctx) => {
+  try {
+    const v = await getVault(vaultId, ownerAccount);
+    const lines = [
+      `Vault: ${vaultId}`,
+      `Agent: ${v.agent}${v.revoked ? " (REVOKED)" : ""}`,
+      `Balance: ${formatNear(v.balance)}`,
+      `Spent today: ${formatNear(v.spent_in_window)}`,
+      `Remaining today: ${formatNear(v.remaining_today)}`,
+    ];
+    if (v.policy) {
+      lines.push(
+        `Max per payment: ${formatNear(v.policy.per_tx_cap)}`,
+        `Daily limit: ${formatNear(v.policy.daily_limit)}`,
+        `Approved: ${v.policy.allowed_recipients.join(", ") || "none"}`,
+      );
+    } else {
+      lines.push("No policy set.");
+    }
+    const once = v.one_time_recipients ?? [];
+    lines.push(`One-time approvals: ${once.join(", ") || "none"}`);
+    await ctx.reply(lines.join("\n"));
+  } catch (err) {
+    console.error("/status failed:", err.message);
+    await ctx.reply("Could not read the vault. Try again.");
+  }
+});
 
 // Graceful stop, as shown in the Telegraf docs.
 process.once("SIGINT", () => bot.stop("SIGINT"));
