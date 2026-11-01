@@ -14,6 +14,7 @@ an agent with a normal wallet key can spend everything it holds. it can be promp
 - the **agent** is a separate near account. it gets a near **function call key** locked to this contract and the single method `execute_payment`. with that key it cannot do anything else on the network, and it cannot touch the owner's other funds.
 - every `execute_payment` call is checked by the contract against the policy. if any rule fails, the call panics and no money moves.
 - the owner can `revoke_agent` (kill switch) and `withdraw` at any time, including after a revoke.
+- the approved list can change on the fly without restarting the daily limit: `add_recipient` adds a recipient for good, `approve_once` adds one that is removed after a single payment (for example a fresh swap deposit address), and `remove_recipient` takes one off. `set_policy` is the full reset and still restarts the daily window.
 - if a transfer fails (for example the recipient account does not exist), a callback puts the money back in the vault and undoes the daily spend.
 
 ## methods
@@ -23,14 +24,24 @@ an agent with a normal wallet key can spend everything it holds. it can be promp
 | `new()` | deployer, once | sets up the contract |
 | `create_vault(agent)` | owner | creates the owner's vault and names the agent account |
 | `fund_vault()` (payable) | owner | adds the attached NEAR to the vault |
-| `set_policy(per_tx_cap, daily_limit, allowed_recipients, expires_at)` | owner | sets the rules. amounts in yoctoNEAR (strings), expiry in nanoseconds |
+| `set_policy(per_tx_cap, daily_limit, allowed_recipients, expires_at)` | owner | sets the rules from scratch. amounts in yoctoNEAR (strings), expiry in nanoseconds. clears one-time approvals and restarts the daily window |
+| `add_recipient(recipient)` | owner | adds a recipient to the approved list for good. does not touch the daily window or what was spent in it |
+| `approve_once(recipient)` | owner | approves a recipient for exactly one payment. the approval is used up by the first accepted payment. does not touch the daily window |
+| `remove_recipient(recipient)` | owner | takes a recipient (permanent or one-time) off the list, for example a one-time approval that was never used. does not touch the daily window |
 | `execute_payment(owner, recipient, amount)` | agent | pays from the owner's vault if every rule passes |
-| `revoke_agent()` | owner | stops the agent from spending |
+| `revoke_agent()` | owner | stops the agent from spending and cancels unused one-time approvals |
 | `rotate_agent(new_agent)` | owner | replaces the agent and turns spending back on |
 | `withdraw(amount)` | owner | sends NEAR from the vault back to the owner |
-| `get_vault(owner)` (view) | anyone | shows balance, agent, policy, revoked flag, spent today, remaining today |
+| `get_vault(owner)` (view) | anyone | shows balance, agent, policy, pending one-time recipients, revoked flag, spent today, remaining today |
 
-payments are refused with a clear message: `agent has been revoked`, `policy has expired`, `recipient is not on the approved list`, `amount is over the per-transaction cap`, `payment would go over the daily limit`, `vault balance is too low`, `caller is not the agent for this vault`.
+notes on the approved list:
+
+- permanent and one-time recipients share one limit of 20 per vault.
+- a one-time approval is used up by the first payment that passes every rule. a payment that is refused does not use it up. if the transfer itself bounces (for example the account does not exist), the money goes back to the vault but the approval stays used, so the owner approves again.
+- payments to a one-time recipient count toward the same per-payment cap and daily limit as any other payment.
+- only the owner can change the list. the agent's key can only call `execute_payment`.
+
+payments are refused with a clear message: `agent has been revoked`, `policy has expired`, `recipient is not on the approved list`, `amount is over the per-transaction cap`, `payment would go over the daily limit`, `vault balance is too low`, `caller is not the agent for this vault`. changing the approved list can also be refused with: `recipient is already on the approved list`, `recipient already has a one-time approval`, `too many approved recipients (the limit is 20)`, `no policy set for this vault`.
 
 ## near tools used
 
@@ -55,6 +66,8 @@ near contract call-function as-read-only vault.wavecapkey.testnet get_vault json
 what you need: rust (the repo pins version 1.93.0 in `rust-toolchain.toml`), the `wasm32-unknown-unknown` target, [cargo-near](https://github.com/near/cargo-near), [near-cli-rs](https://github.com/near/near-cli-rs), and a testnet account with a few NEAR (the examples use `wavecapkey.testnet`, replace it with yours everywhere). no secrets go in the repo, keys stay in your own keychain.
 
 ### build and deploy
+
+note: `approve_once` added a field to the stored vault, so deploy this version to a **fresh account**. do not deploy it over a contract that already holds vaults from the first version, because those vaults could no longer be read.
 
 1. build the contract (run this in `contracts/capkey`):
 
@@ -180,7 +193,7 @@ the agent's key can only call `execute_payment`. trying any other method with it
 
 ## tests
 
-`cargo test` runs 21 unit tests (run on linux), covering: vault creation and funding, an allowed payment, the per-payment cap, the approved list, the daily limit and its 24 hour reset, expiry, a missing policy, a low balance, revoke, withdraw after revoke, agent rotation, wrong caller, and the refund after a failed transfer. the same behaviours were also checked live on testnet (steps 6 to 12 above).
+`cargo test` runs 51 unit tests (run on linux), covering: vault creation and funding, an allowed payment, the per-payment cap, the approved list, the daily limit and its 24 hour reset, expiry, a missing policy, a low balance, revoke, withdraw after revoke, agent rotation, wrong caller, and the refund after a failed transfer. it also covers changing the approved list: adding, one-time approvals and removing recipients without restarting the daily window, the limit of 20 (permanent and one-time together), a one-time approval being used up once and not by a refused payment, and only the owner (never the agent) being able to change the list. the first 21 behaviours were also checked live on testnet (steps 6 to 12 above); the new approved-list methods are covered by the unit tests so far.
 
 ## not built yet
 
