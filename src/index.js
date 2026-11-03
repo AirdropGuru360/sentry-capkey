@@ -9,6 +9,8 @@ import { formatNear } from "./format.js";
 import { isValidAccountId } from "./amount.js";
 import { createAgentAccount, executePayment } from "./pay.js";
 import { bindExecutor, createPayflow } from "./payflow.js";
+import { assessRecipient } from "./risk.js";
+import { BLOCKLIST } from "./blocklist.js";
 
 function readEnv(name) {
   const value = process.env[name];
@@ -59,7 +61,7 @@ bot.use((ctx, next) => {
 
 bot.start((ctx) => ctx.reply("Sentry online"));
 
-// --- /pay wiring (all logic lives in payflow.js) ---
+// --- /pay wiring (all logic lives in payflow.js and risk.js) ---
 let agent = null;
 const getAgent = () =>
   (agent ??= createAgentAccount({
@@ -68,13 +70,40 @@ const getAgent = () =>
     rpcUrl: readEnv("NEAR_RPC_URL") || "https://archival-rpc.testnet.fastnear.com",
   }));
 
+// Recipients paid successfully in this run. First-time payments get a warning.
+const paidBefore = new Set();
+const selfIds = [vaultId, ownerAccount, readEnv("AGENT_ACCOUNT_ID")].filter(Boolean);
+
+async function assess({ recipient, amountYocto }) {
+  try {
+    const vault = await getVault(vaultId, ownerAccount);
+    if (!vault.policy) return { level: "block", reasons: ["risk check failed"] };
+    const approved = [
+      ...(vault.policy.allowed_recipients ?? []),
+      ...(vault.one_time_recipients ?? []),
+    ];
+    return assessRecipient({
+      recipient,
+      amountYocto,
+      approved,
+      perTxCap: BigInt(vault.policy.per_tx_cap),
+      selfIds,
+      blocklist: BLOCKLIST,
+      paidBefore,
+    });
+  } catch {
+    return { level: "block", reasons: ["risk check failed"] };
+  }
+}
+
 const payflow = createPayflow({
   clock: () => Date.now(),
+  assess,
   executePayment: bindExecutor({ getAgent, vaultId, ownerId: ownerAccount, executePayment }),
 });
 
 bot.command("pay", async (ctx) => {
-  const r = payflow.request(ctx.payload);
+  const r = await payflow.request(ctx.payload);
   if (!r.ok) return ctx.reply(r.text);
   await ctx.reply(
     r.text,
@@ -91,6 +120,7 @@ bot.action(/^(confirm|cancel):([A-Za-z0-9-]{1,64})$/, async (ctx) => {
   const [, action, id] = ctx.match;
   await ctx.answerCbQuery();
   const r = action === "confirm" ? await payflow.confirm(id) : payflow.cancel(id);
+  if (r.ok && r.recipient) paidBefore.add(r.recipient);
   await ctx.reply(r.text);
 });
 

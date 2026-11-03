@@ -2,8 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createPayflow, parsePayCommand, bindExecutor } from "../src/payflow.js";
 
-// Fake clock and fake executePayment: no Telegram, no network.
-function setup(executePayment) {
+// Fake clock, fake executePayment and fake risk check: no Telegram, no network.
+function setup({ executePayment, assess } = {}) {
   let now = 1_000_000;
   let n = 0;
   const calls = [];
@@ -13,9 +13,11 @@ function setup(executePayment) {
       calls.push(payment);
       return { ok: true, txHash: "HASH1" };
     });
+  const risk = assess ?? (async () => ({ level: "ok", reasons: [] }));
   const flow = createPayflow({
     clock: () => now,
     executePayment: exec,
+    assess: risk,
     newId: () => `id-${++n}`,
   });
   return {
@@ -48,9 +50,9 @@ test("parsePayCommand rejects an invalid recipient", () => {
   assert.match(r.text, /recipient/i);
 });
 
-test("request asks for confirmation and stores the payment", () => {
+test("request asks for confirmation and stores the payment", async () => {
   const { flow } = setup();
-  const r = flow.request("/pay 0.5 shop.wavecapkey.testnet");
+  const r = await flow.request("/pay 0.5 shop.wavecapkey.testnet");
   assert.equal(r.ok, true);
   assert.equal(r.id, "id-1");
   assert.equal(
@@ -61,7 +63,7 @@ test("request asks for confirmation and stores the payment", () => {
 
 test("the prompt shows the exact amount and the stored amount is exact", async () => {
   const { flow, calls } = setup();
-  const r = flow.request("/pay 0.123456789 shop.wavecapkey.testnet");
+  const r = await flow.request("/pay 0.123456789 shop.wavecapkey.testnet");
   assert.equal(r.ok, true);
   assert.ok(r.text.includes("0.123456789"), r.text);
 
@@ -69,6 +71,69 @@ test("the prompt shows the exact amount and the stored amount is exact", async (
   assert.equal(paid.ok, true);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].amountYocto, 123456789000000000000000n);
+});
+
+test("a blocked recipient creates no pending payment", async () => {
+  const { flow, calls } = setup({
+    assess: async () => ({ level: "block", reasons: ["Recipient is on the blocklist."] }),
+  });
+
+  const r = await flow.request("/pay 0.5 scam-wallet.testnet");
+  assert.equal(r.ok, false);
+  assert.match(r.text, /blocklist/);
+  assert.equal(r.id, undefined);
+
+  // Nothing was stored, so even the id that would have been used is unknown.
+  const after = await flow.confirm("id-1");
+  assert.equal(after.ok, false);
+  assert.match(after.text, /no longer pending/i);
+  assert.equal(calls.length, 0);
+});
+
+test("warnings are added to the confirmation prompt", async () => {
+  const { flow } = setup({
+    assess: async () => ({
+      level: "warn",
+      reasons: ["This is the first payment to this recipient."],
+    }),
+  });
+
+  const r = await flow.request("/pay 0.5 shop.wavecapkey.testnet");
+  assert.equal(r.ok, true);
+  assert.match(r.text, /Warnings:/);
+  assert.match(r.text, /first payment/);
+});
+
+test("a failing risk check blocks instead of paying", async () => {
+  const { flow, calls } = setup({
+    assess: async () => {
+      throw new Error("risk service down");
+    },
+  });
+
+  const r = await flow.request("/pay 0.5 shop.wavecapkey.testnet");
+  assert.equal(r.ok, false);
+  assert.match(r.text, /risk check failed/);
+  assert.equal(calls.length, 0);
+});
+
+test("confirm checks the risk again before paying", async () => {
+  let checks = 0;
+  const { flow, calls } = setup({
+    assess: async () => {
+      checks++;
+      return checks === 1
+        ? { level: "ok", reasons: [] }
+        : { level: "block", reasons: ["Recipient is on the blocklist."] };
+    },
+  });
+
+  const { id } = await flow.request("/pay 0.5 shop.wavecapkey.testnet");
+  const r = await flow.confirm(id);
+  assert.equal(r.ok, false);
+  assert.match(r.text, /blocklist/);
+  assert.equal(checks, 2);
+  assert.equal(calls.length, 0);
 });
 
 test("bindExecutor adds vaultId and ownerId and stays lazy", async () => {
@@ -110,6 +175,7 @@ test("a confirmed payment reaches the vault with vaultId and ownerId", async () 
   const flow = createPayflow({
     clock: () => 1_000_000,
     newId: () => "id-1",
+    assess: async () => ({ level: "ok", reasons: [] }),
     executePayment: bindExecutor({
       getAgent: () => "AGENT",
       vaultId: "vault2.wavecapkey.testnet",
@@ -121,7 +187,7 @@ test("a confirmed payment reaches the vault with vaultId and ownerId", async () 
     }),
   });
 
-  const { id } = flow.request("/pay 0.5 shop.wavecapkey.testnet");
+  const { id } = await flow.request("/pay 0.5 shop.wavecapkey.testnet");
   assert.equal((await flow.confirm(id)).ok, true);
   assert.deepEqual(seen, [
     {
@@ -135,9 +201,10 @@ test("a confirmed payment reaches the vault with vaultId and ownerId", async () 
 
 test("confirm pays with the stored values, not the typed text", async () => {
   const { flow, calls } = setup();
-  const { id } = flow.request("/pay 0.5 shop.wavecapkey.testnet");
+  const { id } = await flow.request("/pay 0.5 shop.wavecapkey.testnet");
   const r = await flow.confirm(id);
   assert.equal(r.ok, true);
+  assert.equal(r.recipient, "shop.wavecapkey.testnet"); // lets index.js fill paidBefore
   assert.equal(
     r.text,
     "Paid. https://explorer.testnet.near.org/transactions/HASH1",
@@ -149,7 +216,7 @@ test("confirm pays with the stored values, not the typed text", async () => {
 
 test("confirm is single use: the second tap never pays", async () => {
   const { flow, calls } = setup();
-  const { id } = flow.request("/pay 0.5 shop.wavecapkey.testnet");
+  const { id } = await flow.request("/pay 0.5 shop.wavecapkey.testnet");
   assert.equal((await flow.confirm(id)).ok, true);
 
   const second = await flow.confirm(id);
@@ -167,7 +234,7 @@ test("unknown id is refused and pays nothing", async () => {
 
 test("an expired request is refused and pays nothing", async () => {
   const { flow, calls, advance } = setup();
-  const { id } = flow.request("/pay 0.5 shop.wavecapkey.testnet");
+  const { id } = await flow.request("/pay 0.5 shop.wavecapkey.testnet");
   advance(60_001);
   const r = await flow.confirm(id);
   assert.equal(r.ok, false);
@@ -177,7 +244,7 @@ test("an expired request is refused and pays nothing", async () => {
 
 test("cancel deletes the pending payment", async () => {
   const { flow, calls } = setup();
-  const { id } = flow.request("/pay 0.5 shop.wavecapkey.testnet");
+  const { id } = await flow.request("/pay 0.5 shop.wavecapkey.testnet");
   assert.equal(flow.cancel(id).ok, true);
 
   const r = await flow.confirm(id);
@@ -186,21 +253,25 @@ test("cancel deletes the pending payment", async () => {
 });
 
 test("a refused payment shows the vault's reason", async () => {
-  const { flow } = setup(async () => ({
-    ok: false,
-    reason: "recipient is not on the approved list",
-  }));
-  const { id } = flow.request("/pay 0.5 shop.wavecapkey.testnet");
+  const { flow } = setup({
+    executePayment: async () => ({
+      ok: false,
+      reason: "recipient is not on the approved list",
+    }),
+  });
+  const { id } = await flow.request("/pay 0.5 shop.wavecapkey.testnet");
   const r = await flow.confirm(id);
   assert.equal(r.ok, false);
   assert.equal(r.text, "recipient is not on the approved list");
 });
 
 test("a thrown error is not reported as success", async () => {
-  const { flow } = setup(async () => {
-    throw new Error("boom");
+  const { flow } = setup({
+    executePayment: async () => {
+      throw new Error("boom");
+    },
   });
-  const { id } = flow.request("/pay 0.5 shop.wavecapkey.testnet");
+  const { id } = await flow.request("/pay 0.5 shop.wavecapkey.testnet");
   const r = await flow.confirm(id);
   assert.equal(r.ok, false);
 });
@@ -217,17 +288,19 @@ test("two simultaneous confirms never run in parallel", async () => {
     release = resolve;
   });
 
-  const { flow } = setup(async () => {
-    running++;
-    maxRunning = Math.max(maxRunning, running);
-    started();
-    await gate;
-    running--;
-    return { ok: true, txHash: "HASH1" };
+  const { flow } = setup({
+    executePayment: async () => {
+      running++;
+      maxRunning = Math.max(maxRunning, running);
+      started();
+      await gate;
+      running--;
+      return { ok: true, txHash: "HASH1" };
+    },
   });
 
-  const a = flow.request("/pay 0.1 shop.wavecapkey.testnet");
-  const b = flow.request("/pay 0.2 shop.wavecapkey.testnet");
+  const a = await flow.request("/pay 0.1 shop.wavecapkey.testnet");
+  const b = await flow.request("/pay 0.2 shop.wavecapkey.testnet");
   const first = flow.confirm(a.id);
   const second = flow.confirm(b.id);
 

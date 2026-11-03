@@ -44,6 +44,7 @@ export function bindExecutor({ getAgent, vaultId, ownerId, executePayment }) {
 export function createPayflow({
   clock,
   executePayment,
+  assess,
   ttlMs = TTL_MS,
   newId = () => randomUUID(),
 }) {
@@ -61,9 +62,30 @@ export function createPayflow({
     return result;
   }
 
-  function request(text) {
+  // The risk check is injected. Any failure is a block: never pay "just in case".
+  async function safeAssess({ recipient, amountYocto }) {
+    try {
+      const risk = await assess({ recipient, amountYocto });
+      const levels = ["ok", "warn", "block"];
+      if (!risk || !levels.includes(risk.level) || !Array.isArray(risk.reasons)) {
+        return { level: "block", reasons: ["risk check failed"] };
+      }
+      return risk;
+    } catch {
+      return { level: "block", reasons: ["risk check failed"] };
+    }
+  }
+
+  function blockText(reasons) {
+    return `Blocked. ${reasons.join(" ")}`;
+  }
+
+  async function request(text) {
     const parsed = parsePayCommand(text);
     if (!parsed.ok) return parsed;
+
+    const risk = await safeAssess(parsed);
+    if (risk.level === "block") return { ok: false, text: blockText(risk.reasons) };
 
     // Drop expired entries so the store cannot grow forever.
     const now = clock();
@@ -77,13 +99,14 @@ export function createPayflow({
       recipient: parsed.recipient,
       expiresAt: now + ttlMs,
     });
-    return {
-      ok: true,
-      id,
-      text: `Pay ${nearText(parsed.amountYocto)} NEAR to ${parsed.recipient}? Expires in ${Math.round(
-        ttlMs / 1000,
-      )} seconds.`,
-    };
+
+    let prompt = `Pay ${nearText(parsed.amountYocto)} NEAR to ${parsed.recipient}? Expires in ${Math.round(
+      ttlMs / 1000,
+    )} seconds.`;
+    if (risk.level === "warn") {
+      prompt += `\n\nWarnings:\n${risk.reasons.map((r) => `- ${r}`).join("\n")}`;
+    }
+    return { ok: true, id, text: prompt };
   }
 
   function confirm(id) {
@@ -94,6 +117,10 @@ export function createPayflow({
       if (clock() > entry.expiresAt) {
         return { ok: false, text: "This payment expired. Send /pay again." };
       }
+
+      // Check again right before paying: rules or approvals may have changed.
+      const risk = await safeAssess(entry);
+      if (risk.level === "block") return { ok: false, text: blockText(risk.reasons) };
 
       let result;
       try {
@@ -109,6 +136,7 @@ export function createPayflow({
       return {
         ok: true,
         txHash: result.txHash,
+        recipient: entry.recipient,
         text: `Paid. https://explorer.testnet.near.org/transactions/${result.txHash}`,
       };
     });
