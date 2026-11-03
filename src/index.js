@@ -6,11 +6,12 @@ import { Markup, Telegraf } from "telegraf";
 import { isOwner, parseOwnerId } from "./owner.js";
 import { getVault } from "./vault.js";
 import { formatNear } from "./format.js";
-import { isValidAccountId } from "./amount.js";
+import { isValidAccountId, parseNear } from "./amount.js";
 import { createAgentAccount, executePayment } from "./pay.js";
 import { bindExecutor, createPayflow } from "./payflow.js";
 import { assessRecipient } from "./risk.js";
 import { BLOCKLIST } from "./blocklist.js";
+import { getDryQuote } from "./intents.js";
 
 function readEnv(name) {
   const value = process.env[name];
@@ -122,6 +123,22 @@ bot.action(/^(confirm|cancel):([A-Za-z0-9-]{1,64})$/, async (ctx) => {
   const r = action === "confirm" ? await payflow.confirm(id) : payflow.cancel(id);
   if (r.ok && r.recipient) paidBefore.add(r.recipient);
   await ctx.reply(r.text);
+});
+
+bot.command("quote", async (ctx) => {
+  const [amount, recipient] = (ctx.payload ?? "").trim().split(/\s+/);
+  const refundTo = readEnv("INTENTS_REFUND_TO");
+  let amountYocto;
+  try {
+    amountYocto = parseNear(amount);
+  } catch {
+    return ctx.reply("quote unavailable");
+  }
+  const q = refundTo ? await getDryQuote({ amountYocto, recipient, refundTo }) : { ok: false };
+  if (!q.ok) return ctx.reply("quote unavailable");
+  await ctx.reply(
+    `Live Intents quote (price check only, NOT executed): ${amount} NEAR (as wNEAR) -> about ${q.receive} USDC on Base, about ${q.seconds} seconds. No funds were moved.`,
+  );
 });
 
 bot.command("status", async (ctx) => {
