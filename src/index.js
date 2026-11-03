@@ -2,10 +2,13 @@
 // Minimal Telegram bot. Every update is owner-only; strangers are ignored silently.
 // Secrets come only from process.env. This file never reads a .env file.
 
-import { Telegraf } from "telegraf";
+import { Markup, Telegraf } from "telegraf";
 import { isOwner, parseOwnerId } from "./owner.js";
 import { getVault } from "./vault.js";
 import { formatNear } from "./format.js";
+import { isValidAccountId } from "./amount.js";
+import { createAgentAccount, executePayment } from "./pay.js";
+import { bindExecutor, createPayflow } from "./payflow.js";
 
 function readEnv(name) {
   const value = process.env[name];
@@ -32,8 +35,10 @@ if (botToken === "") {
 
 const vaultId = readEnv("VAULT_CONTRACT_ID");
 const ownerAccount = readEnv("OWNER_ACCOUNT_ID");
-if (vaultId === "" || ownerAccount === "") {
-  console.error("Sentry cannot start: VAULT_CONTRACT_ID or OWNER_ACCOUNT_ID is empty.");
+if (!isValidAccountId(vaultId) || !isValidAccountId(ownerAccount)) {
+  console.error(
+    "Sentry cannot start: VAULT_CONTRACT_ID and OWNER_ACCOUNT_ID must be valid NEAR account IDs.",
+  );
   process.exit(1);
 }
 
@@ -53,6 +58,41 @@ bot.use((ctx, next) => {
 });
 
 bot.start((ctx) => ctx.reply("Sentry online"));
+
+// --- /pay wiring (all logic lives in payflow.js) ---
+let agent = null;
+const getAgent = () =>
+  (agent ??= createAgentAccount({
+    keyFile: readEnv("AGENT_KEY_FILE"),
+    accountId: readEnv("AGENT_ACCOUNT_ID"),
+    rpcUrl: readEnv("NEAR_RPC_URL") || "https://archival-rpc.testnet.fastnear.com",
+  }));
+
+const payflow = createPayflow({
+  clock: () => Date.now(),
+  executePayment: bindExecutor({ getAgent, vaultId, ownerId: ownerAccount, executePayment }),
+});
+
+bot.command("pay", async (ctx) => {
+  const r = payflow.request(ctx.payload);
+  if (!r.ok) return ctx.reply(r.text);
+  await ctx.reply(
+    r.text,
+    Markup.inlineKeyboard([
+      [
+        Markup.button.callback("Confirm", `confirm:${r.id}`),
+        Markup.button.callback("Cancel", `cancel:${r.id}`),
+      ],
+    ]),
+  );
+});
+
+bot.action(/^(confirm|cancel):([A-Za-z0-9-]{1,64})$/, async (ctx) => {
+  const [, action, id] = ctx.match;
+  await ctx.answerCbQuery();
+  const r = action === "confirm" ? await payflow.confirm(id) : payflow.cancel(id);
+  await ctx.reply(r.text);
+});
 
 bot.command("status", async (ctx) => {
   try {

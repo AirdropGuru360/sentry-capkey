@@ -14,7 +14,7 @@ export function createAgentAccount({ keyFile, accountId, rpcUrl }) {
 export function refusalReason(err) {
   const msg = String(err?.message ?? err);
   const m = msg.match(/capkey: ([^"\n]*)/);
-  return m ? m[1].trim() : "payment failed";
+  return m ? m[1].trim() : "result unknown, check /status before trying again";
 }
 
 export async function executePayment(account, { vaultId, ownerId, recipient, amountYocto }) {

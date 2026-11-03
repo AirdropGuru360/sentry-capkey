@@ -49,3 +49,10 @@ test("a missing tx hash is not treated as success", async () => {
   const account = { callFunctionRaw: async () => ({}) };
   assert.equal((await executePayment(account, base)).ok, false);
 });
+
+test("a non-vault error says the result is unknown", async () => {
+  const account = { callFunctionRaw: async () => { throw new Error("socket hang up"); } };
+  const r = await executePayment(account, base);
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /unknown/);
+});
