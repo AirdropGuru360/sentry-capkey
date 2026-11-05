@@ -12,6 +12,8 @@ import { bindExecutor, createPayflow } from "./payflow.js";
 import { assessRecipient } from "./risk.js";
 import { BLOCKLIST } from "./blocklist.js";
 import { getDryQuote } from "./intents.js";
+import { proposeFromText } from "./propose.js";
+import { ALIASES } from "./aliases.js";
 
 function readEnv(name) {
   const value = process.env[name];
@@ -103,8 +105,9 @@ const payflow = createPayflow({
   executePayment: bindExecutor({ getAgent, vaultId, ownerId: ownerAccount, executePayment }),
 });
 
-bot.command("pay", async (ctx) => {
-  const r = await payflow.request(ctx.payload);
+// One payment path for /pay and for plain-language messages.
+async function startPayment(ctx, payload) {
+  const r = await payflow.request(payload);
   if (!r.ok) return ctx.reply(r.text);
   await ctx.reply(
     r.text,
@@ -115,6 +118,18 @@ bot.command("pay", async (ctx) => {
       ],
     ]),
   );
+}
+
+bot.command("pay", (ctx) => startPayment(ctx, ctx.payload));
+
+// Plain-language mode, e.g. "pay shop 0.5". Rule-based; same payflow as /pay,
+// so the risk check, confirmation, expiry and vault rules all still apply.
+bot.on("text", async (ctx, next) => {
+  if (ctx.message.text.startsWith("/")) return next();
+  const p = proposeFromText(ctx.message.text, { aliases: ALIASES });
+  if (!p.ok) return ctx.reply(p.reason);
+  const amount = formatNear(p.amountYocto, 24).replace(/ NEAR$/, "");
+  return startPayment(ctx, `${amount} ${p.recipient}`);
 });
 
 bot.action(/^(confirm|cancel):([A-Za-z0-9-]{1,64})$/, async (ctx) => {
