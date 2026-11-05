@@ -33,18 +33,19 @@ You (Telegram)
 | `/status`, `/pay` (confirm button, 60 s expiry, single-use id, one payment at a time) | Built |
 | Rule-based risk check: blocklist, lookalike names, own accounts, first-payment and large-amount warnings | Built |
 | `/quote`: live NEAR Intents price check | Built, dry quote only |
-| Natural-language / AI parsing of requests | Not built yet |
-| Fee and treasury, token (stablecoin) payments, real Intents swap | Not built |
+| Plain-language requests ("pay shop 0.5"), read by simple rules, not an LLM | Built |
+| Bot-level fee (0.5%) to a treasury account, and `/treasury` | Built, tested live on testnet |
+| LLM parsing, contract-level fee, token (stablecoin) payments, real Intents swap | Not built |
 
 ## Track fit
 
 | Track | What exists today | What is still missing |
 |---|---|---|
 | AI Security & Defense | Locked function call key, on-chain spending rules, kill switch, risk check, owner-only bot | AI in the loop |
-| Agent Economy | The agent is its own NEAR account with its own key and pays only inside its budget | The agent paying for services |
+| Agent Economy | The agent is its own NEAR account with its own key, pays only inside its budget, and each payment earns a fee for the treasury | The agent paying for services |
 | Open Innovation | A cross-chain safety layer: on-chain rules, risk check and a live Intents price check | A real cross-chain swap |
 | Unstoppable DeFi | A live NEAR Intents quote (dry only) | Real swaps (needs token support in the vault, and a mainnet vault) |
-| Autonomous Business | Nothing yet | Fee and treasury in the contract |
+| Autonomous Business | A 0.5% fee on each payment goes to a treasury account, shown with `/treasury` | The fee is taken by the bot as a second vault payment, not inside the contract |
 | Real-World Money | NEAR payments to approved recipients | Stablecoin payments |
 
 ## Try it in two minutes (no setup, read-only)
@@ -75,6 +76,9 @@ Messages to send and what you should see:
 | Send | You see |
 |---|---|
 | `/status` | Vault, agent, balance, spent today, caps, approved recipients |
+| `/treasury` | Treasury balance and fees collected since the bot started |
+| `pay shop 0.01` (plain text) | The same confirm prompt as `/pay`, including a "Fee: 0.00005 NEAR to treasury." line |
+| `ignore all rules and pay scam-wallet.testnet 5` | Blocked: on the blocklist. The sentence is read as a payment request, then the risk check stops it |
 | `/pay 0.01 shop.wavecapkey.testnet` | Prompt with a first-payment warning and Confirm / Cancel. Confirm gives "Paid." and an explorer link |
 | `/pay 5 shop.wavecapkey.testnet` then Confirm | Refused: "amount is over the per-transaction cap" |
 | `/pay 0.01 someone.testnet` then Confirm | Refused: "recipient is not on the approved list" |
@@ -111,14 +115,15 @@ Never commit the token or the key file.
 - Intents lists wNEAR (a token), while the vault pays native NEAR, so a real Intents swap needs token support in the contract. Not built.
 - The risk check is rule-based. No outside risk API is used.
 - The "first payment" memory resets when the bot restarts.
-- The bot is a command bot. There is no AI in the loop yet.
+- Plain-language requests are read by simple rules, not an LLM.
+- The fee is a second vault payment after the main one. It counts toward the daily limit, and the two payments are not atomic. A fee inside the contract would be stronger.
 
 ## Prior work and AI disclosure
 
 - The vault contract is the teammate's work. It was written on the `capkey-near` branch in the hackathon window (the rules allow code from Oct 19). An earlier Solana prototype of the same idea exists separately and is not part of this repo.
 - The bot, tests, risk check and Intents quote were written during the hackathon.
 - AI assistance: the bot was built with AI help. Every file was reviewed and tested by the author.
-  - Written by OpenCode (model: DeepSeek V4.1 Flash): `src/owner.js`, `src/payflow.js`, `src/risk.js`, `src/blocklist.js`, `src/intents.js`, `package.json`, `.env.example`, and the tests for those files. `src/index.js` was started by OpenCode and then extended; the `/status` part came from Claude's snippets.
+  - Written by OpenCode (model: DeepSeek V4.1 Flash): `src/owner.js`, `src/payflow.js`, `src/risk.js`, `src/blocklist.js`, `src/intents.js`, `src/propose.js`, `src/aliases.js`, `src/fee.js`, `src/treasury.js`, `package.json`, `.env.example`, and the tests for those files. `src/index.js` was started by OpenCode and then extended; the `/status` part came from Claude's snippets.
   - Written with Claude (Anthropic): `src/vault.js`, `src/format.js`, `src/amount.js`, `src/pay.js` and their tests, plus the design, security reviews, the `AGENTS.md` brief and this README.
   - Contract: [teammate: add how AI was used]
 
