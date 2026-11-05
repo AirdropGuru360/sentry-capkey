@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createPayflow, parsePayCommand, bindExecutor } from "../src/payflow.js";
+import { assessRecipient } from "../src/risk.js";
 
 // Fake clock, fake executePayment and fake risk check: no Telegram, no network.
-function setup({ executePayment, assess } = {}) {
+function setup({ executePayment, assess, treasury, feeBps = 50 } = {}) {
   let now = 1_000_000;
   let n = 0;
   const calls = [];
@@ -18,6 +19,8 @@ function setup({ executePayment, assess } = {}) {
     clock: () => now,
     executePayment: exec,
     assess: risk,
+    treasury,
+    feeBps,
     newId: () => `id-${++n}`,
   });
   return {
@@ -207,7 +210,7 @@ test("confirm pays with the stored values, not the typed text", async () => {
   assert.equal(r.recipient, "shop.wavecapkey.testnet"); // lets index.js fill paidBefore
   assert.equal(
     r.text,
-    "Paid. https://explorer.testnet.near.org/transactions/HASH1",
+    "Paid.\nhttps://explorer.testnet.near.org/transactions/HASH1",
   );
   assert.deepEqual(calls, [
     { recipient: "shop.wavecapkey.testnet", amountYocto: 500000000000000000000000n },
@@ -306,6 +309,202 @@ test("two simultaneous confirms never run in parallel", async () => {
 
   await firstStarted;
   await new Promise((resolve) => setTimeout(resolve, 20)); // let the second one try
+  assert.equal(maxRunning, 1);
+
+  release();
+  const [ra, rb] = await Promise.all([first, second]);
+  assert.equal(ra.ok, true);
+  assert.equal(rb.ok, true);
+  assert.equal(maxRunning, 1);
+});
+
+const TREASURY = "dave-treasury.testnet";
+
+test("the prompt shows the fee when a treasury is set", async () => {
+  const { flow } = setup({ treasury: TREASURY });
+  const r = await flow.request("/pay 1 shop.wavecapkey.testnet");
+  assert.equal(r.ok, true);
+  assert.match(r.text, /Fee: 0\.005 NEAR to treasury\./);
+});
+
+test("no treasury means no fee and exactly one call", async () => {
+  const { flow, calls } = setup();
+  const r = await flow.request("/pay 1 shop.wavecapkey.testnet");
+  assert.doesNotMatch(r.text, /Fee:/);
+
+  const paid = await flow.confirm(r.id);
+  assert.equal(paid.ok, true);
+  assert.equal(calls.length, 1);
+  assert.equal(flow.getCollectedFees(), 0n);
+});
+
+test("a failed main payment is never charged a fee", async () => {
+  const seen = [];
+  const { flow } = setup({
+    treasury: TREASURY,
+    executePayment: async (payment) => {
+      seen.push(payment);
+      return { ok: false, reason: "daily limit reached" };
+    },
+  });
+
+  const { id } = await flow.request("/pay 1 shop.wavecapkey.testnet");
+  const r = await flow.confirm(id);
+  assert.equal(r.ok, false);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].recipient, "shop.wavecapkey.testnet");
+  assert.equal(flow.getCollectedFees(), 0n);
+});
+
+test("a successful payment also collects the fee, with both links", async () => {
+  const seen = [];
+  let n = 0;
+  const { flow } = setup({
+    treasury: TREASURY,
+    executePayment: async (payment) => {
+      seen.push(payment);
+      n++;
+      return { ok: true, txHash: `H${n}` };
+    },
+  });
+
+  const { id } = await flow.request("/pay 1 shop.wavecapkey.testnet");
+  const r = await flow.confirm(id);
+
+  assert.equal(r.ok, true);
+  assert.equal(seen.length, 2);
+  assert.deepEqual(seen[0], {
+    recipient: "shop.wavecapkey.testnet",
+    amountYocto: 10n ** 24n,
+  });
+  assert.deepEqual(seen[1], { recipient: TREASURY, amountYocto: 5n * 10n ** 21n });
+  assert.match(r.text, /transactions\/H1/);
+  assert.match(r.text, /transactions\/H2/);
+  assert.match(r.text, /Fee: 0\.005 NEAR/);
+  assert.equal(flow.getCollectedFees(), 5n * 10n ** 21n);
+});
+
+test("a failed fee keeps the main payment paid and is never retried", async () => {
+  let feeCalls = 0;
+  const { flow } = setup({
+    treasury: TREASURY,
+    executePayment: async (payment) => {
+      if (payment.recipient === TREASURY) {
+        feeCalls++;
+        return { ok: false, reason: "treasury is locked" };
+      }
+      return { ok: true, txHash: "MAIN" };
+    },
+  });
+
+  const { id } = await flow.request("/pay 1 shop.wavecapkey.testnet");
+  const r = await flow.confirm(id);
+
+  assert.equal(r.ok, true);
+  assert.equal(
+    r.text,
+    "Paid.\nhttps://explorer.testnet.near.org/transactions/MAIN\nFee not collected: treasury is locked",
+  );
+  assert.equal(feeCalls, 1);
+  assert.equal(flow.getCollectedFees(), 0n);
+});
+
+test("a fee that throws is reported, not retried", async () => {
+  let feeCalls = 0;
+  const { flow } = setup({
+    treasury: TREASURY,
+    executePayment: async (payment) => {
+      if (payment.recipient === TREASURY) {
+        feeCalls++;
+        throw new Error("socket hang up");
+      }
+      return { ok: true, txHash: "MAIN" };
+    },
+  });
+
+  const { id } = await flow.request("/pay 1 shop.wavecapkey.testnet");
+  const r = await flow.confirm(id);
+
+  assert.equal(r.ok, true);
+  assert.match(r.text, /Fee not collected: payment failed/);
+  assert.equal(feeCalls, 1);
+});
+
+test("a fee computation error still reports the main payment as paid", async () => {
+  const seen = [];
+  const { flow } = setup({
+    treasury: TREASURY,
+    feeBps: 500, // invalid: computeFee throws at fee time
+    executePayment: async (payment) => {
+      seen.push(payment);
+      return { ok: true, txHash: "MAIN" };
+    },
+  });
+
+  const { id } = await flow.request("/pay 1 shop.wavecapkey.testnet");
+  const r = await flow.confirm(id);
+
+  assert.equal(r.ok, true);
+  assert.equal(seen.length, 1);
+  assert.equal(
+    r.text,
+    "Paid.\nhttps://explorer.testnet.near.org/transactions/MAIN\nFee not collected: fee error.",
+  );
+  assert.equal(flow.getCollectedFees(), 0n);
+});
+
+test("the treasury is blocked as one of our own accounts", async () => {
+  const { flow, calls } = setup({
+    treasury: TREASURY,
+    assess: async ({ recipient, amountYocto }) =>
+      assessRecipient({
+        recipient,
+        amountYocto,
+        approved: ["shop.wavecapkey.testnet"],
+        perTxCap: 10n * 10n ** 24n,
+        selfIds: [TREASURY],
+        blocklist: [],
+        paidBefore: new Set(),
+      }),
+  });
+
+  const r = await flow.request("/pay 1 dave-treasury.testnet");
+  assert.equal(r.ok, false);
+  assert.match(r.text, /own accounts/);
+  assert.equal(calls.length, 0);
+});
+
+test("two concurrent confirms never overlap, including fee calls", async () => {
+  let running = 0;
+  let maxRunning = 0;
+  let started;
+  const firstStarted = new Promise((resolve) => {
+    started = resolve;
+  });
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+
+  const { flow } = setup({
+    treasury: TREASURY,
+    executePayment: async () => {
+      running++;
+      maxRunning = Math.max(maxRunning, running);
+      started();
+      await gate;
+      running--;
+      return { ok: true, txHash: "H" };
+    },
+  });
+
+  const a = await flow.request("/pay 1 shop.wavecapkey.testnet");
+  const b = await flow.request("/pay 2 shop.wavecapkey.testnet");
+  const first = flow.confirm(a.id);
+  const second = flow.confirm(b.id);
+
+  await firstStarted;
+  await new Promise((resolve) => setTimeout(resolve, 20));
   assert.equal(maxRunning, 1);
 
   release();

@@ -14,6 +14,7 @@ import { BLOCKLIST } from "./blocklist.js";
 import { getDryQuote } from "./intents.js";
 import { proposeFromText } from "./propose.js";
 import { ALIASES } from "./aliases.js";
+import { getBalance } from "./treasury.js";
 
 function readEnv(name) {
   const value = process.env[name];
@@ -47,7 +48,14 @@ if (!isValidAccountId(vaultId) || !isValidAccountId(ownerAccount)) {
   process.exit(1);
 }
 
+const treasury = readEnv("TREASURY_ACCOUNT_ID");
+if (treasury !== "" && !isValidAccountId(treasury)) {
+  console.error("Sentry cannot start: TREASURY_ACCOUNT_ID must be a valid NEAR account ID.");
+  process.exit(1);
+}
+
 console.log("Sentry starting");
+if (treasury === "") console.log("fee disabled");
 
 const bot = new Telegraf(botToken);
 
@@ -75,7 +83,7 @@ const getAgent = () =>
 
 // Recipients paid successfully in this run. First-time payments get a warning.
 const paidBefore = new Set();
-const selfIds = [vaultId, ownerAccount, readEnv("AGENT_ACCOUNT_ID")].filter(Boolean);
+const selfIds = [vaultId, ownerAccount, readEnv("AGENT_ACCOUNT_ID"), treasury].filter(Boolean);
 
 async function assess({ recipient, amountYocto }) {
   try {
@@ -102,6 +110,7 @@ async function assess({ recipient, amountYocto }) {
 const payflow = createPayflow({
   clock: () => Date.now(),
   assess,
+  treasury: treasury || undefined,
   executePayment: bindExecutor({ getAgent, vaultId, ownerId: ownerAccount, executePayment }),
 });
 
@@ -153,6 +162,17 @@ bot.command("quote", async (ctx) => {
   if (!q.ok) return ctx.reply("quote unavailable");
   await ctx.reply(
     `Live Intents quote (price check only, NOT executed): ${amount} NEAR (as wNEAR) -> about ${q.receive} USDC on Base, about ${q.seconds} seconds. No funds were moved.`,
+  );
+});
+
+bot.command("treasury", async (ctx) => {
+  if (!treasury) return ctx.reply("Fee disabled: no treasury configured.");
+  const b = await getBalance(treasury);
+  if (!b.ok) return ctx.reply("Could not read the treasury balance.");
+  await ctx.reply(
+    `Treasury ${treasury}: ${formatNear(b.yocto)}. Fees collected since the bot started: ${formatNear(
+      payflow.getCollectedFees(),
+    )}.`,
   );
 });
 

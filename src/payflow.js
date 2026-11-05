@@ -5,6 +5,7 @@
 import { randomUUID } from "node:crypto";
 import { parseNear, isValidAccountId } from "./amount.js";
 import { formatNear } from "./format.js";
+import { FEE_BPS, computeFee } from "./fee.js";
 
 export const TTL_MS = 60_000;
 const USAGE =
@@ -45,10 +46,19 @@ export function createPayflow({
   clock,
   executePayment,
   assess,
+  treasury,
+  feeBps = FEE_BPS,
   ttlMs = TTL_MS,
   newId = () => randomUUID(),
 }) {
   const pending = new Map();
+  let collectedFees = 0n;
+
+  // A fee exists only when a treasury is configured. Without one, nothing changes.
+  const feeOn = typeof treasury === "string" && treasury !== "";
+  function feeFor(amountYocto) {
+    return feeOn ? computeFee(amountYocto, feeBps) : 0n;
+  }
 
   // One payment at a time. Confirmations go through this queue, so two taps
   // can never reach the vault in parallel.
@@ -106,6 +116,13 @@ export function createPayflow({
     if (risk.level === "warn") {
       prompt += `\n\nWarnings:\n${risk.reasons.map((r) => `- ${r}`).join("\n")}`;
     }
+    let fee = 0n;
+    try {
+      fee = feeFor(parsed.amountYocto);
+    } catch {
+      fee = 0n; // the confirm step reports the fee error
+    }
+    if (fee > 0n) prompt += `\nFee: ${formatNear(fee, 24)} to treasury.`;
     return { ok: true, id, text: prompt };
   }
 
@@ -133,11 +150,59 @@ export function createPayflow({
         return { ok: false, text: "Payment failed." };
       }
       if (!result?.ok) return { ok: false, text: result?.reason ?? "Payment failed." };
+
+      const link = (hash) => `https://explorer.testnet.near.org/transactions/${hash}`;
+      const mainLink = link(result.txHash);
+
+      // After a successful main payment nothing may throw: a fee problem is
+      // reported, never retried, and never undoes the payment.
+      let fee;
+      try {
+        fee = feeFor(entry.amountYocto);
+      } catch {
+        return {
+          ok: true,
+          txHash: result.txHash,
+          recipient: entry.recipient,
+          feeYocto: 0n,
+          text: `Paid.\n${mainLink}\nFee not collected: fee error.`,
+        };
+      }
+
+      if (fee === 0n) {
+        return {
+          ok: true,
+          txHash: result.txHash,
+          recipient: entry.recipient,
+          feeYocto: 0n,
+          text: `Paid.\n${mainLink}`,
+        };
+      }
+
+      // The treasury is fixed configuration, so the fee skips the risk check.
+      // One attempt only: a failed fee is reported and never retried.
+      let feeText;
+      let feeTxHash;
+      try {
+        const feeResult = await executePayment({ recipient: treasury, amountYocto: fee });
+        if (feeResult?.ok && typeof feeResult.txHash === "string") {
+          collectedFees += fee;
+          feeTxHash = feeResult.txHash;
+          feeText = `Fee: ${formatNear(fee, 24)} to treasury.\n${link(feeResult.txHash)}`;
+        } else {
+          feeText = `Fee not collected: ${feeResult?.reason ?? "payment failed"}`;
+        }
+      } catch {
+        feeText = "Fee not collected: payment failed";
+      }
+
       return {
         ok: true,
         txHash: result.txHash,
         recipient: entry.recipient,
-        text: `Paid. https://explorer.testnet.near.org/transactions/${result.txHash}`,
+        feeYocto: fee,
+        feeTxHash,
+        text: `Paid.\n${mainLink}\n${feeText}`,
       };
     });
   }
@@ -147,5 +212,5 @@ export function createPayflow({
     return { ok: true, text: had ? "Payment cancelled." : "This payment is no longer pending." };
   }
 
-  return { request, confirm, cancel };
+  return { request, confirm, cancel, getCollectedFees: () => collectedFees };
 }
