@@ -35,7 +35,8 @@ You (Telegram)
 | `/quote`: live NEAR Intents price check | Built, dry quote only |
 | Plain-language requests ("pay shop 0.5"), read by simple rules, not an LLM | Built |
 | Bot-level fee (0.5%) to a treasury account, and `/treasury` | Built, tested live on testnet |
-| LLM parsing, contract-level fee, token (stablecoin) payments, real Intents swap | Not built |
+| Contract-level fee (teammate): `set_fee`, fee taken inside `execute_payment`, 79 unit tests | Written and unit-tested. Not deployed or used by the bot yet |
+| LLM parsing, token (stablecoin) payments, real Intents swap | Not built |
 
 ## Track fit
 
@@ -45,7 +46,7 @@ You (Telegram)
 | Agent Economy | The agent is its own NEAR account with its own key, pays only inside its budget, and each payment earns a fee for the treasury | The agent paying for services |
 | Open Innovation | A cross-chain safety layer: on-chain rules, risk check and a live Intents price check | A real cross-chain swap |
 | Unstoppable DeFi | A live NEAR Intents quote (dry only) | Real swaps (needs token support in the vault, and a mainnet vault) |
-| Autonomous Business | A 0.5% fee on each payment goes to a treasury account, shown with `/treasury` | The fee is taken by the bot as a second vault payment, not inside the contract |
+| Autonomous Business | A 0.5% fee on each payment goes to a treasury account, shown with `/treasury` | Today the bot takes the fee as a second vault payment. A contract-level fee is written and unit-tested in the teammate's code, but it is not deployed or used by the bot yet |
 | Real-World Money | NEAR payments to approved recipients | Stablecoin payments |
 
 ## Try it in two minutes (no setup, read-only)
@@ -116,13 +117,15 @@ Never commit the token or the key file.
 - The risk check is rule-based. No outside risk API is used.
 - The "first payment" memory resets when the bot restarts.
 - Plain-language requests are read by simple rules, not an LLM.
-- The fee is a second vault payment after the main one. It counts toward the daily limit, and the two payments are not atomic. A fee inside the contract would be stronger.
+- The fee is a second vault payment after the main one. It counts toward the daily limit, and the two payments are not atomic. A contract-level fee is written and unit-tested, but not deployed or wired into the bot yet.
 
 ## Prior work and AI disclosure
 
 - The vault contract is the teammate's work. It was written on the `capkey-near` branch in the hackathon window (the rules allow code from Oct 19). An earlier Solana prototype of the same idea exists separately and is not part of this repo.
 - The bot, tests, risk check and Intents quote were written during the hackathon.
 - AI assistance: the whole project was built with AI help, and every file was reviewed and tested by its author.
+  - What was ours: choosing the project and the tracks, deciding what to build and in what order, approving each design, running and testing everything live on testnet, and fixing the problems the reviews found.
+  - What the AI did: most of the code, plus design suggestions and code reviews (Claude).
   - Written by OpenCode (model: DeepSeek V4.1 Flash): `src/owner.js`, `src/payflow.js`, `src/risk.js`, `src/blocklist.js`, `src/intents.js`, `src/propose.js`, `src/aliases.js`, `src/fee.js`, `src/treasury.js`, `package.json`, `.env.example`, and the tests for those files. `src/index.js` was started by OpenCode and then extended; the `/status` part came from Claude's snippets.
   - Written with Claude (Anthropic): `src/vault.js`, `src/format.js`, `src/amount.js`, `src/pay.js` and their tests, plus the design, security reviews, the `AGENTS.md` brief and this README.
   - Contract (the teammate's account): written with Claude (Anthropic) in chat, step by step: `contracts/capkey/src/lib.rs`, its 51 unit tests and the contract README. The teammate chose the idea and the rules, ran every command, built, deployed, live-tested and pushed it. The idea and the test list come from an earlier Solana prototype of the teammate's; the teammate states that no code was reused from it.
