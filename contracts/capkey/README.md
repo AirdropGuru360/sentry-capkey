@@ -15,6 +15,7 @@ an agent with a normal wallet key can spend everything it holds. it can be promp
 - every `execute_payment` call is checked by the contract against the policy. if any rule fails, the call panics and no money moves.
 - the owner can `revoke_agent` (kill switch) and `withdraw` at any time, including after a revoke.
 - the approved list can change on the fly without restarting the daily limit: `add_recipient` adds a recipient for good, `approve_once` adds one that is removed after a single payment (for example a fresh swap deposit address), and `remove_recipient` takes one off. `set_policy` is the full reset and still restarts the daily window.
+- the owner can also set a fee (`set_fee`, at most 2%). the contract sends it to a treasury account inside every `execute_payment`, on top of the payment, so the agent cannot skip it.
 - if a transfer fails (for example the recipient account does not exist), a callback puts the money back in the vault and undoes the daily spend.
 
 ## methods
@@ -28,11 +29,12 @@ an agent with a normal wallet key can spend everything it holds. it can be promp
 | `add_recipient(recipient)` | owner | adds a recipient to the approved list for good. does not touch the daily window or what was spent in it |
 | `approve_once(recipient)` | owner | approves a recipient for exactly one payment. the approval is used up by the first accepted payment. does not touch the daily window |
 | `remove_recipient(recipient)` | owner | takes a recipient (permanent or one-time) off the list, for example a one-time approval that was never used. does not touch the daily window |
-| `execute_payment(owner, recipient, amount)` | agent | pays from the owner's vault if every rule passes |
+| `set_fee(bps, treasury)` | owner | sets a fee in basis points (50 = 0.5%, at most 200) that is sent to `treasury` on every payment. `bps` of 0 turns it off. does not touch the daily window or the policy |
+| `execute_payment(owner, recipient, amount)` | agent | pays from the owner's vault if every rule passes. if a fee is set, the fee is sent to the treasury in the same call |
 | `revoke_agent()` | owner | stops the agent from spending and cancels unused one-time approvals |
 | `rotate_agent(new_agent)` | owner | replaces the agent and turns spending back on |
 | `withdraw(amount)` | owner | sends NEAR from the vault back to the owner |
-| `get_vault(owner)` (view) | anyone | shows balance, agent, policy, pending one-time recipients, revoked flag, spent today, remaining today |
+| `get_vault(owner)` (view) | anyone | shows balance, agent, policy, pending one-time recipients, fee (`fee_bps`, `fee_treasury`), `total_fees_paid`, revoked flag, spent today, remaining today |
 
 notes on the approved list:
 
@@ -41,7 +43,16 @@ notes on the approved list:
 - payments to a one-time recipient count toward the same per-payment cap and daily limit as any other payment.
 - only the owner can change the list. the agent's key can only call `execute_payment`.
 
-payments are refused with a clear message: `agent has been revoked`, `policy has expired`, `recipient is not on the approved list`, `amount is over the per-transaction cap`, `payment would go over the daily limit`, `vault balance is too low`, `caller is not the agent for this vault`. changing the approved list can also be refused with: `recipient is already on the approved list`, `recipient already has a one-time approval`, `too many approved recipients (the limit is 20)`, `no policy set for this vault`.
+notes on the fee:
+
+- the vault owner sets the fee for their own vault. the agent cannot change it or skip it, because the fee is sent inside the same `execute_payment` call. the owner can change or turn off the fee at any time.
+- the fee is charged **on top of** the payment: the recipient gets the full `amount`, and the vault pays `amount` plus the fee. the fee is `amount * bps / 10000`, rounded down, so a very small payment can have a fee of 0 (then no fee transfer is sent).
+- the fee counts toward the per-payment cap, the daily limit and the balance check, so those limits stay hard ceilings on everything that leaves the vault. with a fee on, a payment of exactly the cap is refused, because amount plus fee is over the cap.
+- the treasury does not need to be on the approved list, and it cannot be the vault contract itself.
+- the payment and the fee go out together. if one of the two transfers bounces (for example the account does not exist), only that one goes back to the vault and its daily spend is undone. `total_fees_paid` only counts fees that arrived.
+- a vault with no fee (the default) behaves exactly as it did before `set_fee` existed.
+
+payments are refused with a clear message: `agent has been revoked`, `policy has expired`, `recipient is not on the approved list`, `amount is over the per-transaction cap`, `payment would go over the daily limit`, `vault balance is too low`, `caller is not the agent for this vault`. changing the approved list can also be refused with: `recipient is already on the approved list`, `recipient already has a one-time approval`, `too many approved recipients (the limit is 20)`, `no policy set for this vault`. `set_fee` can be refused with: `fee is over the limit of 200 basis points (2%)`, `the fee treasury cannot be the vault contract itself`.
 
 ## near tools used
 
@@ -67,7 +78,7 @@ what you need: rust (the repo pins version 1.93.0 in `rust-toolchain.toml`), the
 
 ### build and deploy
 
-note: `approve_once` added a field to the stored vault, so deploy this version to a **fresh account**. do not deploy it over a contract that already holds vaults from the first version, because those vaults could no longer be read.
+note: `approve_once` and `set_fee` each added fields to the stored vault, so deploy this version to a **fresh account**. do not deploy it over a contract that already holds vaults from the first version, because those vaults could no longer be read.
 
 1. build the contract (run this in `contracts/capkey`):
 
@@ -193,7 +204,7 @@ the agent's key can only call `execute_payment`. trying any other method with it
 
 ## tests
 
-`cargo test` runs 51 unit tests (run on linux), covering: vault creation and funding, an allowed payment, the per-payment cap, the approved list, the daily limit and its 24 hour reset, expiry, a missing policy, a low balance, revoke, withdraw after revoke, agent rotation, wrong caller, and the refund after a failed transfer. it also covers changing the approved list: adding, one-time approvals and removing recipients without restarting the daily window, the limit of 20 (permanent and one-time together), a one-time approval being used up once and not by a refused payment, and only the owner (never the agent) being able to change the list. the first 21 behaviours were also checked live on testnet (steps 6 to 12 above); the new approved-list methods are covered by the unit tests so far.
+`cargo test` runs 79 unit tests (run on linux), covering: vault creation and funding, an allowed payment, the per-payment cap, the approved list, the daily limit and its 24 hour reset, expiry, a missing policy, a low balance, revoke, withdraw after revoke, agent rotation, wrong caller, and the refund after a failed transfer. it also covers changing the approved list: adding, one-time approvals and removing recipients without restarting the daily window, the limit of 20 (permanent and one-time together), a one-time approval being used up once and not by a refused payment, and only the owner (never the agent) being able to change the list. it also covers the fee: the 2% maximum, owner-only, the fee counting toward the cap, the daily limit and the balance, rounding down, the fee going out in the same call as the payment, and a bounced payment or a bounced fee being refunded on its own. the first 21 behaviours were also checked live on testnet (steps 6 to 12 above); the approved-list methods and the fee are covered by the unit tests so far.
 
 ## not built yet
 
@@ -206,3 +217,5 @@ the agent's key can only call `execute_payment`. trying any other method with it
 ## history
 
 the idea and the list of test cases come from an earlier solana prototype of capkey by the same author, which is a separate project and is not part of this repo. no code from it was reused. the contract in this folder was written from scratch for near, starting on 2026-10-28.
+
+built with Claude (Anthropic), step by step in chat. the author chose the idea and rules, and ran, deployed and tested it.
