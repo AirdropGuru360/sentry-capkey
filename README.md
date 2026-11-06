@@ -122,10 +122,10 @@ Never commit the token or the key file.
 
 - The vault contract is the teammate's work. It was written on the `capkey-near` branch in the hackathon window (the rules allow code from Oct 19). An earlier Solana prototype of the same idea exists separately and is not part of this repo.
 - The bot, tests, risk check and Intents quote were written during the hackathon.
-- AI assistance: the bot was built with AI help. Every file was reviewed and tested by the author.
+- AI assistance: the whole project was built with AI help, and every file was reviewed and tested by its author.
   - Written by OpenCode (model: DeepSeek V4.1 Flash): `src/owner.js`, `src/payflow.js`, `src/risk.js`, `src/blocklist.js`, `src/intents.js`, `src/propose.js`, `src/aliases.js`, `src/fee.js`, `src/treasury.js`, `package.json`, `.env.example`, and the tests for those files. `src/index.js` was started by OpenCode and then extended; the `/status` part came from Claude's snippets.
   - Written with Claude (Anthropic): `src/vault.js`, `src/format.js`, `src/amount.js`, `src/pay.js` and their tests, plus the design, security reviews, the `AGENTS.md` brief and this README.
-  - Contract: [teammate: add how AI was used]
+  - Contract (the teammate's account): written with Claude (Anthropic) in chat, step by step: `contracts/capkey/src/lib.rs`, its 51 unit tests and the contract README. The teammate chose the idea and the rules, ran every command, built, deployed, live-tested and pushed it. The idea and the test list come from an earlier Solana prototype of the teammate's; the teammate states that no code was reused from it.
 
 ## Team
 
