@@ -50,6 +50,7 @@ export function createPayflow({
   feeBps = FEE_BPS,
   ttlMs = TTL_MS,
   newId = () => randomUUID(),
+  onPaid,
 }) {
   const pending = new Map();
   let collectedFees = 0n;
@@ -160,6 +161,25 @@ export function createPayflow({
       try {
         fee = feeFor(entry.amountYocto);
       } catch {
+        // Fee computation failed; still report the main payment as paid.
+        // onPaid is called below after the helper is defined.
+        fee = null;
+      }
+
+      // Helper: call onPaid after success. Never throws, never changes the result.
+      async function notifyPaid(info) {
+        if (typeof onPaid !== "function") return;
+        try { await onPaid(info); } catch {}
+      }
+
+      if (fee === null) {
+        await notifyPaid({
+          recipient: entry.recipient,
+          amountYocto: entry.amountYocto,
+          txHash: result.txHash,
+          feeYocto: 0n,
+          feeTxHash: undefined,
+        });
         return {
           ok: true,
           txHash: result.txHash,
@@ -170,6 +190,14 @@ export function createPayflow({
       }
 
       if (fee === 0n) {
+        const info = {
+          recipient: entry.recipient,
+          amountYocto: entry.amountYocto,
+          txHash: result.txHash,
+          feeYocto: 0n,
+          feeTxHash: undefined,
+        };
+        await notifyPaid(info);
         return {
           ok: true,
           txHash: result.txHash,
@@ -196,6 +224,14 @@ export function createPayflow({
         feeText = "Fee not collected: payment failed";
       }
 
+      const finalInfo = {
+        recipient: entry.recipient,
+        amountYocto: entry.amountYocto,
+        txHash: result.txHash,
+        feeYocto: feeTxHash ? fee : 0n,
+        feeTxHash,
+      };
+      await notifyPaid(finalInfo);
       return {
         ok: true,
         txHash: result.txHash,

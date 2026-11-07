@@ -513,3 +513,102 @@ test("two concurrent confirms never overlap, including fee calls", async () => {
   assert.equal(rb.ok, true);
   assert.equal(maxRunning, 1);
 });
+
+// ---------------------------------------------------------------------------
+// onPaid callback
+// ---------------------------------------------------------------------------
+
+test("onPaid is called once after a successful payment (no fee)", async () => {
+  const calls = [];
+  let n = 0;
+  const flow = createPayflow({
+    clock: () => 1_000_000,
+    newId: () => `id-${++n}`,
+    assess: async () => ({ level: "ok", reasons: [] }),
+    executePayment: async () => ({ ok: true, txHash: "HTXHASH" }),
+    onPaid: async (info) => { calls.push(info); },
+  });
+
+  const { id } = await flow.request("/pay 0.5 shop.wavecapkey.testnet");
+  const r = await flow.confirm(id);
+
+  assert.equal(r.ok, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].recipient, "shop.wavecapkey.testnet");
+  assert.equal(calls[0].amountYocto, 500000000000000000000000n);
+  assert.equal(calls[0].txHash, "HTXHASH");
+  assert.equal(calls[0].feeYocto, 0n);
+  assert.equal(calls[0].feeTxHash, undefined);
+});
+
+test("onPaid is not called when the payment fails or is blocked", async () => {
+  const calls = [];
+  let n = 0;
+
+  // Blocked at request time
+  const blocked = createPayflow({
+    clock: () => 1_000_000,
+    newId: () => `id-${++n}`,
+    assess: async () => ({ level: "block", reasons: ["blocklisted"] }),
+    executePayment: async () => ({ ok: true, txHash: "HTXHASH" }),
+    onPaid: async (info) => { calls.push(info); },
+  });
+  await blocked.request("/pay 0.5 shop.wavecapkey.testnet");
+  assert.equal(calls.length, 0);
+
+  // Failed at execute time
+  const failed = createPayflow({
+    clock: () => 1_000_000,
+    newId: () => `id-${++n}`,
+    assess: async () => ({ level: "ok", reasons: [] }),
+    executePayment: async () => ({ ok: false, reason: "daily limit reached" }),
+    onPaid: async (info) => { calls.push(info); },
+  });
+  const { id } = await failed.request("/pay 0.5 shop.wavecapkey.testnet");
+  await failed.confirm(id);
+  assert.equal(calls.length, 0);
+});
+
+test("a throwing onPaid does not change the result", async () => {
+  let n = 0;
+  const flow = createPayflow({
+    clock: () => 1_000_000,
+    newId: () => `id-${++n}`,
+    assess: async () => ({ level: "ok", reasons: [] }),
+    executePayment: async () => ({ ok: true, txHash: "HTXHASH" }),
+    onPaid: async () => { throw new Error("callback boom"); },
+  });
+
+  const { id } = await flow.request("/pay 0.5 shop.wavecapkey.testnet");
+  const r = await flow.confirm(id);
+
+  assert.equal(r.ok, true);
+  assert.equal(r.txHash, "HTXHASH");
+});
+
+test("onPaid receives feeYocto 0n and no feeTxHash when the fee payment fails", async () => {
+  const calls = [];
+  let n = 0;
+  const TREASURY = "dave-treasury.testnet";
+
+  const flow = createPayflow({
+    clock: () => 1_000_000,
+    newId: () => `id-${++n}`,
+    assess: async () => ({ level: "ok", reasons: [] }),
+    treasury: TREASURY,
+    executePayment: async (payment) => {
+      if (payment.recipient === TREASURY) return { ok: false, reason: "treasury locked" };
+      return { ok: true, txHash: "MAIN" };
+    },
+    onPaid: async (info) => { calls.push(info); },
+  });
+
+  const { id } = await flow.request("/pay 1 shop.wavecapkey.testnet");
+  const r = await flow.confirm(id);
+
+  assert.equal(r.ok, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].txHash, "MAIN");
+  assert.equal(calls[0].feeYocto, 0n);
+  assert.equal(calls[0].feeTxHash, undefined);
+});

@@ -15,6 +15,16 @@ import { getDryQuote } from "./intents.js";
 import { proposeFromText } from "./propose.js";
 import { ALIASES } from "./aliases.js";
 import { getBalance } from "./treasury.js";
+import {
+  loadPayees,
+  addPayee,
+  removePayee,
+  appendReceipt,
+  readReceipts,
+} from "./store.js";
+import { formatPayeesLines } from "./payees-status.js";
+import path from "node:path";
+import os from "node:os";
 
 function readEnv(name) {
   const value = process.env[name];
@@ -56,6 +66,29 @@ if (treasury !== "" && !isValidAccountId(treasury)) {
 
 console.log("Sentry starting");
 if (treasury === "") console.log("fee disabled");
+
+// Payee book (store.js). The data directory is kept out of this file so the
+// store can be tested in isolation with a temp dir.
+const DEFAULT_DATA_DIR = path.join(os.homedir(), ".sentry");
+function getDataDir() {
+  const env = process.env.SENTRY_DATA_DIR;
+  return (typeof env === "string" && env.trim() !== "") ? env.trim() : DEFAULT_DATA_DIR;
+}
+
+let payees = {};
+{
+  const loaded = loadPayees(getDataDir());
+  payees = loaded ?? {};
+  console.log(`Payee book: ${Object.keys(payees).length} entries`);
+}
+
+function reloadPayees() {
+  try {
+    payees = loadPayees(getDataDir()) ?? {};
+  } catch {
+    // keep the previous in-memory set; store already logs a warning
+  }
+}
 
 const bot = new Telegraf(botToken);
 
@@ -112,6 +145,21 @@ const payflow = createPayflow({
   assess,
   treasury: treasury || undefined,
   executePayment: bindExecutor({ getAgent, vaultId, ownerId: ownerAccount, executePayment }),
+  onPaid({ recipient, amountYocto, txHash, feeYocto, feeTxHash }) {
+    // Append a receipt. Never throws: failure is logged, not fatal.
+    try {
+      appendReceipt(getDataDir(), {
+        t: new Date().toISOString(),
+        recipient,
+        amountYocto: amountYocto.toString(),
+        txHash,
+        feeYocto: feeYocto.toString(),
+        feeTxHash: feeTxHash ?? null,
+      });
+    } catch (err) {
+      console.error("appendReceipt failed:", err?.message);
+    }
+  },
 });
 
 // One payment path for /pay and for plain-language messages.
@@ -135,7 +183,7 @@ bot.command("pay", (ctx) => startPayment(ctx, ctx.payload));
 // so the risk check, confirmation, expiry and vault rules all still apply.
 bot.on("text", async (ctx, next) => {
   if (ctx.message.text.startsWith("/")) return next();
-  const p = proposeFromText(ctx.message.text, { aliases: ALIASES });
+  const p = proposeFromText(ctx.message.text, { aliases: { ...ALIASES, ...payees } });
   if (!p.ok) return ctx.reply(p.reason);
   const amount = formatNear(p.amountYocto, 24).replace(/ NEAR$/, "");
   return startPayment(ctx, `${amount} ${p.recipient}`);
@@ -202,6 +250,85 @@ bot.command("status", async (ctx) => {
     console.error("/status failed:", err.message);
     await ctx.reply("Could not read the vault. Try again.");
   }
+});
+
+// ---------------------------------------------------------------------------
+// Payee book commands (/payee add, /payee remove, /payees, /receipts)
+// ---------------------------------------------------------------------------
+
+// /payee add <name> <account>  or  /payee remove <name>
+bot.command("payee", async (ctx) => {
+  const parts = (ctx.payload ?? "").trim().split(/\s+/).filter(Boolean);
+  const sub = (parts[0] ?? "").toLowerCase();
+
+  if (sub === "add") {
+    const [, name, account] = parts;
+    if (!name || !account) {
+      return ctx.reply("Usage: /payee add <name> <account>");
+    }
+    const result = addPayee(getDataDir(), name, account, {
+      blocklist: BLOCKLIST,
+      selfIds,
+    });
+    if (!result.ok) return ctx.reply(`Could not add payee: ${result.reason}`);
+    reloadPayees();
+    return ctx.reply(
+      `Saved ${name.toLowerCase()} -> ${account}. The vault must also approve it (owner: add_recipient) before you can pay it.`,
+    );
+  }
+
+  if (sub === "remove") {
+    const [, name] = parts;
+    if (!name) return ctx.reply("Usage: /payee remove <name>");
+    const result = removePayee(getDataDir(), name);
+    if (!result.ok) return ctx.reply(`Could not remove payee: ${result.reason}`);
+    reloadPayees();
+    return ctx.reply(`Removed ${name.toLowerCase()}.`);
+  }
+
+  return ctx.reply("Usage: /payee add <name> <account>  or  /payee remove <name>");
+});
+
+// /payees — list all saved payees with vault approval status
+bot.command("payees", async (ctx) => {
+  const entries = Object.entries(payees);
+  if (entries.length === 0) return ctx.reply("No payees saved.");
+
+  // Try to fetch vault state to show real approval status.
+  let vault = null;
+  try {
+    vault = await getVault(vaultId, ownerAccount);
+    if (!vault.policy) vault = null; // policy missing → unknown
+  } catch {
+    vault = null; // getVault failed → unknown
+  }
+
+  const lines = formatPayeesLines(payees, vault);
+  return ctx.reply(lines.join("\n"));
+});
+
+// /receipts — show the last 5 receipts
+bot.command("receipts", (ctx) => {
+  const list = readReceipts(getDataDir(), 5);
+  if (list.length === 0) return ctx.reply("No receipts yet.");
+
+  // Build a reverse-lookup: account -> name, from the current payee book.
+  const nameOf = Object.fromEntries(Object.entries(payees).map(([n, a]) => [a, n]));
+
+  const lines = list.map((r) => {
+    const date = r.t ?? "?";
+    const amount = (() => {
+      try { return formatNear(BigInt(r.amountYocto)); } catch { return String(r.amountYocto ?? "?"); }
+    })();
+    const recipient = r.recipient ?? "?";
+    const payeeName = nameOf[recipient];
+    const recipientLabel = payeeName ? `${recipient} (${payeeName})` : recipient;
+    const explorerLink = r.txHash
+      ? `https://explorer.testnet.near.org/transactions/${r.txHash}`
+      : "?";
+    return `${date}\n${amount} to ${recipientLabel}\n${explorerLink}`;
+  });
+  return ctx.reply(lines.join("\n\n"));
 });
 
 // Graceful stop, as shown in the Telegraf docs.
