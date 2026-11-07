@@ -11,6 +11,10 @@
 //! one payment (for example a fresh deposit address from a swap quote), and
 //! `remove_recipient` takes either kind back off.
 //!
+//! The owner can also set a fee (`set_fee`, at most 2%) that the contract sends to a
+//! treasury account inside every `execute_payment`, on top of the payment itself. The
+//! agent cannot skip it, because it is part of the same call.
+//!
 //! Amounts are in yoctoNEAR (1 NEAR = 10^24 yoctoNEAR). Timestamps are nanoseconds.
 
 use near_sdk::json_types::{U128, U64};
@@ -25,6 +29,9 @@ use near_sdk::{
 const DAY_NS: u64 = 86_400_000_000_000;
 /// Most recipients a vault can have at once: permanent and one-time approvals together.
 const MAX_RECIPIENTS: usize = 20;
+/// The highest fee an owner can set: 200 basis points = 2%.
+const MAX_FEE_BPS: u16 = 200;
+const BPS_DENOMINATOR: u128 = 10_000;
 const CALLBACK_GAS: Gas = Gas::from_tgas(5);
 
 #[near(serializers = [borsh])]
@@ -42,6 +49,15 @@ struct Policy {
     expires_at: u64,
 }
 
+/// A fee that is paid to `treasury` on top of every payment: `bps` basis points
+/// (1 bps = 0.01%) of the payment amount, rounded down.
+#[near(serializers = [borsh])]
+#[derive(Clone)]
+struct Fee {
+    bps: u16,
+    treasury: AccountId,
+}
+
 #[near(serializers = [borsh])]
 struct Vault {
     agent: AccountId,
@@ -53,6 +69,10 @@ struct Vault {
     /// Recipients approved for exactly one payment each. A recipient leaves this list
     /// the moment a payment to it is accepted.
     one_time_recipients: Vec<AccountId>,
+    /// The fee taken on every payment, if the owner set one.
+    fee: Option<Fee>,
+    /// Total fees sent to the treasury so far (fees that bounced are not counted).
+    fees_paid: u128,
 }
 
 #[near(serializers = [json])]
@@ -70,6 +90,11 @@ pub struct VaultView {
     pub revoked: bool,
     pub policy: Option<PolicyView>,
     pub one_time_recipients: Vec<AccountId>,
+    /// Fee in basis points (0 means no fee) and where it goes.
+    pub fee_bps: u16,
+    pub fee_treasury: Option<AccountId>,
+    /// Total fees paid to the treasury so far, in yoctoNEAR.
+    pub total_fees_paid: U128,
     pub spent_in_window: U128,
     pub window_start: U64,
     pub remaining_today: U128,
@@ -113,6 +138,8 @@ impl Capkey {
                 spent_in_window: 0,
                 revoked: false,
                 one_time_recipients: Vec::new(),
+                fee: None,
+                fees_paid: 0,
             },
         );
         log_event("vault_created", json!({ "owner": owner, "agent": agent }));
@@ -284,6 +311,38 @@ impl Capkey {
         );
     }
 
+    /// Set the fee the contract takes on every payment: `bps` basis points (50 = 0.5%)
+    /// of the payment amount, rounded down, sent to `treasury` inside the same
+    /// `execute_payment` call. It is charged ON TOP of the payment, and it counts toward
+    /// the per-transaction cap, the daily limit and the balance check, so the limits
+    /// stay hard ceilings on what leaves the vault. The treasury does not need to be on
+    /// the approved list. The most allowed is 200 bps (2%). `bps` of 0 turns the fee
+    /// off. Does not touch the daily window or the policy.
+    pub fn set_fee(&mut self, bps: u16, treasury: AccountId) {
+        let owner = env::predecessor_account_id();
+        require!(
+            bps <= MAX_FEE_BPS,
+            "capkey: fee is over the limit of 200 basis points (2%)"
+        );
+        require!(
+            treasury != env::current_account_id(),
+            "capkey: the fee treasury cannot be the vault contract itself"
+        );
+        let vault = self.vault_mut(&owner);
+        vault.fee = if bps == 0 {
+            None
+        } else {
+            Some(Fee {
+                bps,
+                treasury: treasury.clone(),
+            })
+        };
+        log_event(
+            "fee_set",
+            json!({ "owner": owner, "bps": bps, "treasury": treasury }),
+        );
+    }
+
     /// Kill switch: the agent can no longer spend, and any unused one-time approvals
     /// are cancelled. Funds stay yours to withdraw.
     pub fn revoke_agent(&mut self) {
@@ -339,7 +398,9 @@ impl Capkey {
 
     /// Called by the agent account: pay `amount` from `owner`'s vault to `recipient`,
     /// but only if every rule in the policy allows it. Otherwise this panics and
-    /// nothing moves.
+    /// nothing moves. If the owner set a fee, the fee is sent to the treasury in the
+    /// same call, on top of `amount`, and counts toward the cap, the daily limit and the
+    /// balance check.
     pub fn execute_payment(
         &mut self,
         owner: AccountId,
@@ -370,8 +431,27 @@ impl Capkey {
             on_permanent_list || one_time_slot.is_some(),
             "capkey: recipient is not on the approved list"
         );
+
+        // The fee (zero when none is set) is charged on top of the amount. Everything
+        // that leaves the vault, fee included, is held to the cap, the daily limit and
+        // the balance.
+        let fee_config = vault.fee.clone();
+        let fee = match &fee_config {
+            Some(f) => {
+                amount
+                    .0
+                    .checked_mul(f.bps as u128)
+                    .unwrap_or_else(|| env::panic_str("capkey: amount is too large"))
+                    / BPS_DENOMINATOR
+            }
+            None => 0,
+        };
+        let total = amount
+            .0
+            .checked_add(fee)
+            .unwrap_or_else(|| env::panic_str("capkey: amount is too large"));
         require!(
-            amount.0 <= policy.per_tx_cap,
+            total <= policy.per_tx_cap,
             "capkey: amount is over the per-transaction cap"
         );
 
@@ -383,18 +463,16 @@ impl Capkey {
             vault.window_start = now;
         }
         require!(
-            vault.spent_in_window + amount.0 <= policy.daily_limit,
+            vault.spent_in_window + total <= policy.daily_limit,
             "capkey: payment would go over the daily limit"
         );
-        require!(
-            amount.0 <= vault.balance,
-            "capkey: vault balance is too low"
-        );
+        require!(total <= vault.balance, "capkey: vault balance is too low");
 
         // Update the books first, then send the money. A one-time approval is used up
         // here, once every rule has passed.
-        vault.balance -= amount.0;
-        vault.spent_in_window += amount.0;
+        vault.balance -= total;
+        vault.spent_in_window += total;
+        vault.fees_paid += fee;
         let window_start = vault.window_start;
         let used_one_time_approval = match one_time_slot {
             Some(i) if !on_permanent_list => {
@@ -411,17 +489,38 @@ impl Capkey {
                 "agent": caller,
                 "recipient": recipient,
                 "amount": amount.0.to_string(),
+                "fee": fee.to_string(),
                 "one_time_approval_used": used_one_time_approval,
             }),
         );
 
-        Promise::new(recipient)
-            .transfer(NearToken::from_yoctonear(amount.0))
-            .then(
+        let payment = Promise::new(recipient).transfer(NearToken::from_yoctonear(amount.0));
+        match fee_config {
+            // No fee: one transfer, exactly as before.
+            None => payment.then(
                 Self::ext(env::current_account_id())
                     .with_static_gas(CALLBACK_GAS)
                     .on_transfer_resolved(owner, amount, true, U64(window_start)),
-            )
+            ),
+            // Fee: the payment and the fee go out together, and one callback checks both.
+            Some(f) => {
+                if fee == 0 {
+                    // The fee rounded down to nothing, so there is nothing to send.
+                    return payment.then(
+                        Self::ext(env::current_account_id())
+                            .with_static_gas(CALLBACK_GAS)
+                            .on_transfer_resolved(owner, amount, true, U64(window_start)),
+                    );
+                }
+                let fee_transfer =
+                    Promise::new(f.treasury).transfer(NearToken::from_yoctonear(fee));
+                payment.and(fee_transfer).then(
+                    Self::ext(env::current_account_id())
+                        .with_static_gas(CALLBACK_GAS)
+                        .on_payment_with_fee_resolved(owner, amount, U128(fee), U64(window_start)),
+                )
+            }
+        }
     }
 
     // -------------------------------------------------------------- callback
@@ -458,6 +557,52 @@ impl Capkey {
         }
     }
 
+    /// Runs after a payment that carried a fee: result 0 is the payment, result 1 is the
+    /// fee. Each transfer that failed (for example the recipient or the treasury account
+    /// does not exist) goes back to the vault, and its daily spend is undone. Returns
+    /// whether the payment itself went through.
+    #[private]
+    pub fn on_payment_with_fee_resolved(
+        &mut self,
+        owner: AccountId,
+        amount: U128,
+        fee: U128,
+        window_start: U64,
+    ) -> bool {
+        require!(
+            env::promise_results_count() == 2,
+            "capkey: expected two promise results"
+        );
+        let payment_failed = transfer_failed(0);
+        let fee_failed = transfer_failed(1);
+        if payment_failed || fee_failed {
+            let vault = self.vault_mut(&owner);
+            let same_window = vault.window_start == window_start.0;
+            if payment_failed {
+                vault.balance += amount.0;
+                if same_window {
+                    vault.spent_in_window = vault.spent_in_window.saturating_sub(amount.0);
+                }
+                log_event(
+                    "transfer_failed_refunded",
+                    json!({ "owner": owner, "amount": amount.0.to_string() }),
+                );
+            }
+            if fee_failed {
+                vault.balance += fee.0;
+                vault.fees_paid = vault.fees_paid.saturating_sub(fee.0);
+                if same_window {
+                    vault.spent_in_window = vault.spent_in_window.saturating_sub(fee.0);
+                }
+                log_event(
+                    "fee_transfer_failed_refunded",
+                    json!({ "owner": owner, "fee": fee.0.to_string() }),
+                );
+            }
+        }
+        !payment_failed
+    }
+
     // ----------------------------------------------------------------- views
 
     pub fn get_vault(&self, owner: AccountId) -> Option<VaultView> {
@@ -487,6 +632,9 @@ impl Capkey {
             revoked: vault.revoked,
             policy: policy_view,
             one_time_recipients: vault.one_time_recipients.clone(),
+            fee_bps: vault.fee.as_ref().map_or(0, |f| f.bps),
+            fee_treasury: vault.fee.as_ref().map(|f| f.treasury.clone()),
+            total_fees_paid: U128(vault.fees_paid),
             spent_in_window: U128(vault.spent_in_window),
             window_start: U64(vault.window_start),
             remaining_today: U128(remaining),
@@ -499,6 +647,15 @@ impl Capkey {
         self.vaults
             .get_mut(owner)
             .unwrap_or_else(|| env::panic_str("capkey: no vault for this owner"))
+    }
+}
+
+/// True if the transfer behind promise result `index` failed.
+fn transfer_failed(index: u64) -> bool {
+    match env::promise_result_checked(index, 0) {
+        Ok(_) => false,
+        Err(PromiseError::Failed) => true,
+        Err(_) => env::panic_str("capkey: unexpected transfer result"),
     }
 }
 
@@ -1175,5 +1332,398 @@ mod tests {
         let mut c = setup();
         ctx(agent(), 0, T0);
         c.remove_recipient(shop());
+    }
+
+    // ------------------------------------------------------------------ fee
+
+    /// The account that receives the fee.
+    fn treasury() -> AccountId {
+        "treasury.testnet".parse().unwrap()
+    }
+
+    /// Same as `setup()` with a fee of `bps` basis points going to `treasury()`.
+    /// Leaves the context set to the owner.
+    fn setup_with_fee(bps: u16) -> Capkey {
+        let mut c = setup();
+        as_owner(T0);
+        c.set_fee(bps, treasury());
+        c
+    }
+
+    /// Run the callback of a payment that carried a fee, with these two transfer results
+    /// (payment first, fee second).
+    fn resolve_with_fee(
+        c: &mut Capkey,
+        payment: PromiseResult,
+        fee_result: PromiseResult,
+        amount: u128,
+        fee: u128,
+    ) -> bool {
+        testing_env!(
+            VMContextBuilder::new()
+                .current_account_id(contract())
+                .predecessor_account_id(contract())
+                .block_timestamp(T0)
+                .build(),
+            near_sdk::test_vm_config(),
+            near_sdk::RuntimeFeesConfig::test(),
+            Default::default(),
+            vec![payment, fee_result]
+        );
+        c.on_payment_with_fee_resolved(owner(), U128(amount), U128(fee), U64(T0))
+    }
+
+    // a vault with no fee behaves exactly as before
+
+    #[test]
+    fn a_new_vault_has_no_fee() {
+        let c = setup();
+        let v = view(&c);
+        assert_eq!(v.fee_bps, 0);
+        assert!(v.fee_treasury.is_none());
+        assert_eq!(v.total_fees_paid.0, 0);
+    }
+
+    #[test]
+    fn a_payment_without_a_fee_pays_no_fee() {
+        let mut c = setup();
+        pay(&mut c, agent(), shop(), NEAR, T0);
+        let v = view(&c);
+        assert_eq!(v.balance.0, 9 * NEAR);
+        assert_eq!(v.spent_in_window.0, NEAR);
+        assert_eq!(v.total_fees_paid.0, 0);
+    }
+
+    // set_fee
+
+    #[test]
+    fn set_fee_shows_up_in_the_vault_view() {
+        let c = setup_with_fee(50);
+        let v = view(&c);
+        assert_eq!(v.fee_bps, 50);
+        assert_eq!(v.fee_treasury, Some(treasury()));
+        assert_eq!(v.total_fees_paid.0, 0);
+    }
+
+    #[test]
+    fn set_fee_allows_exactly_two_percent() {
+        let c = setup_with_fee(200);
+        assert_eq!(view(&c).fee_bps, 200);
+    }
+
+    #[test]
+    #[should_panic(expected = "over the limit of 200 basis points")]
+    fn set_fee_over_two_percent_is_blocked() {
+        let _ = setup_with_fee(201);
+    }
+
+    #[test]
+    fn set_fee_to_zero_turns_the_fee_off() {
+        let mut c = setup_with_fee(50);
+        as_owner(T0);
+        c.set_fee(0, treasury());
+        let v = view(&c);
+        assert_eq!(v.fee_bps, 0);
+        assert!(v.fee_treasury.is_none());
+        pay(&mut c, agent(), shop(), NEAR, T0);
+        assert_eq!(view(&c).balance.0, 9 * NEAR);
+    }
+
+    #[test]
+    #[should_panic(expected = "treasury cannot be the vault contract itself")]
+    fn the_treasury_cannot_be_the_contract() {
+        let mut c = setup();
+        as_owner(T0);
+        c.set_fee(50, contract());
+    }
+
+    #[test]
+    #[should_panic(expected = "no vault for this owner")]
+    fn set_fee_is_owner_only() {
+        let mut c = setup();
+        ctx(stranger(), 0, T0);
+        c.set_fee(50, treasury());
+    }
+
+    #[test]
+    #[should_panic(expected = "no vault for this owner")]
+    fn the_agent_cannot_set_the_fee() {
+        let mut c = setup();
+        ctx(agent(), 0, T0);
+        c.set_fee(0, treasury());
+    }
+
+    #[test]
+    fn set_fee_does_not_touch_the_daily_window() {
+        let mut c = setup();
+        pay(&mut c, agent(), shop(), NEAR, T0);
+        let before = view(&c);
+        as_owner(T0 + 1_000);
+        c.set_fee(50, treasury());
+        let after = view(&c);
+        assert_eq!(after.spent_in_window.0, NEAR);
+        assert_eq!(after.window_start.0, before.window_start.0);
+    }
+
+    #[test]
+    fn set_policy_and_revoke_keep_the_fee() {
+        let mut c = setup_with_fee(50);
+        as_owner(T0);
+        c.set_policy(
+            U128(NEAR),
+            U128(3 * NEAR),
+            vec![shop()],
+            U64(T0 + 7 * DAY_NS),
+        );
+        assert_eq!(view(&c).fee_bps, 50);
+        c.revoke_agent();
+        assert_eq!(view(&c).fee_bps, 50);
+    }
+
+    // the fee is taken inside execute_payment
+
+    #[test]
+    fn a_payment_with_a_fee_takes_the_fee_on_top() {
+        let mut c = setup_with_fee(50);
+        let amount = NEAR / 2;
+        pay(&mut c, agent(), shop(), amount, T0);
+
+        // 0.5% of 0.5 NEAR is 0.0025 NEAR
+        let fee = NEAR / 400;
+        let v = view(&c);
+        assert_eq!(v.total_fees_paid.0, fee);
+        assert_eq!(v.balance.0, 10 * NEAR - amount - fee);
+        assert_eq!(v.spent_in_window.0, amount + fee);
+        assert!(near_sdk::test_utils::get_logs()
+            .iter()
+            .any(|l| l.contains(&format!("\"fee\":\"{fee}\""))));
+    }
+
+    #[test]
+    fn the_fee_goes_out_in_the_same_call_as_the_payment() {
+        let mut c = setup_with_fee(50);
+        pay(&mut c, agent(), shop(), NEAR / 2, T0);
+
+        // one receipt batch: a transfer to the shop and a transfer to the treasury
+        let receipts = near_sdk::test_utils::get_created_receipts();
+        let text = format!("{receipts:?}");
+        assert!(text.contains(shop().as_str()));
+        assert!(text.contains(treasury().as_str()));
+    }
+
+    #[test]
+    fn the_fee_is_rounded_down() {
+        let mut c = setup_with_fee(50);
+        // 0.5% of 399 yoctoNEAR is 1.995, which rounds down to 1
+        pay(&mut c, agent(), shop(), 399, T0);
+        assert_eq!(view(&c).total_fees_paid.0, 1);
+    }
+
+    #[test]
+    fn a_fee_that_rounds_to_nothing_sends_no_fee() {
+        let mut c = setup_with_fee(50);
+        // 0.5% of 100 yoctoNEAR is 0.5, which rounds down to 0
+        pay(&mut c, agent(), shop(), 100, T0);
+        let v = view(&c);
+        assert_eq!(v.total_fees_paid.0, 0);
+        assert_eq!(v.balance.0, 10 * NEAR - 100);
+        let text = format!("{:?}", near_sdk::test_utils::get_created_receipts());
+        assert!(!text.contains(treasury().as_str()));
+    }
+
+    #[test]
+    fn the_treasury_does_not_need_to_be_on_the_approved_list() {
+        let mut c = setup_with_fee(100);
+        assert!(!view(&c)
+            .policy
+            .unwrap()
+            .allowed_recipients
+            .contains(&treasury()));
+        pay(&mut c, agent(), shop(), NEAR / 2, T0);
+        // 1% of 0.5 NEAR
+        assert_eq!(view(&c).total_fees_paid.0, NEAR / 200);
+    }
+
+    #[test]
+    #[should_panic(expected = "over the per-transaction cap")]
+    fn the_fee_counts_toward_the_per_transaction_cap() {
+        // the cap is 1 NEAR: 1 NEAR plus a fee is more than that
+        let mut c = setup_with_fee(50);
+        pay(&mut c, agent(), shop(), NEAR, T0);
+        pay(&mut c, agent(), shop(), NEAR, T0 + 1);
+    }
+
+    #[test]
+    fn a_payment_that_fits_under_the_cap_with_its_fee_goes_through() {
+        // 0.99 NEAR plus 0.5% (0.00495) is 0.99495, under the 1 NEAR cap
+        let mut c = setup_with_fee(50);
+        pay(&mut c, agent(), shop(), NEAR / 100 * 99, T0);
+        assert_eq!(view(&c).total_fees_paid.0, NEAR / 100 * 99 / 200);
+    }
+
+    #[test]
+    #[should_panic(expected = "over the daily limit")]
+    fn the_fee_counts_toward_the_daily_limit() {
+        // The daily limit is 3 NEAR. With a 2% fee, three payments of 0.9 NEAR cost
+        // 0.918 NEAR each, 2.754 in total, which leaves 0.246 NEAR for the day.
+        let mut c = setup_with_fee(200);
+        for i in 0..3 {
+            pay(&mut c, agent(), shop(), NEAR / 10 * 9, T0 + i);
+        }
+        assert_eq!(
+            view(&c).spent_in_window.0,
+            3 * (NEAR / 10 * 9 + NEAR / 500 * 9)
+        );
+        assert_eq!(view(&c).remaining_today.0, NEAR / 1000 * 246);
+        // 0.245 NEAR alone would fit in the 0.246 left, but 0.245 plus its fee
+        // (0.0049 NEAR) does not, so this is refused.
+        pay(&mut c, agent(), shop(), NEAR / 1000 * 245, T0 + 3);
+    }
+
+    #[test]
+    fn a_payment_whose_fee_still_fits_in_the_daily_limit_goes_through() {
+        // Same day as above, but 0.24 NEAR plus its 0.0048 fee is 0.2448: it fits.
+        let mut c = setup_with_fee(200);
+        for i in 0..3 {
+            pay(&mut c, agent(), shop(), NEAR / 10 * 9, T0 + i);
+        }
+        pay(&mut c, agent(), shop(), NEAR / 100 * 24, T0 + 3);
+        // 0.246 left, minus 0.24 and 0.0048, leaves 0.0012
+        assert_eq!(view(&c).remaining_today.0, NEAR / 10_000 * 12);
+    }
+
+    #[test]
+    #[should_panic(expected = "vault balance is too low")]
+    fn the_fee_counts_toward_the_balance_check() {
+        // 1 NEAR in the vault and a 1 NEAR payment: the fee on top does not fit
+        ctx(owner(), 0, T0);
+        let mut c = Capkey::new();
+        c.create_vault(agent());
+        ctx(owner(), NEAR, T0);
+        c.fund_vault();
+        ctx(owner(), 0, T0);
+        c.set_policy(
+            U128(2 * NEAR),
+            U128(3 * NEAR),
+            vec![shop()],
+            U64(T0 + DAY_NS),
+        );
+        c.set_fee(50, treasury());
+        pay(&mut c, agent(), shop(), NEAR, T0);
+    }
+
+    #[test]
+    fn a_refused_payment_pays_no_fee() {
+        let mut c = setup_with_fee(50);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            pay(&mut c, agent(), stranger(), NEAR / 2, T0);
+        }));
+        assert!(result.is_err());
+        let v = view(&c);
+        assert_eq!(v.total_fees_paid.0, 0);
+        assert_eq!(v.balance.0, 10 * NEAR);
+    }
+
+    #[test]
+    fn a_one_time_approval_still_works_with_a_fee() {
+        let mut c = setup_with_fee(50);
+        as_owner(T0);
+        c.approve_once(stranger());
+        pay(&mut c, agent(), stranger(), NEAR / 2, T0);
+        let v = view(&c);
+        assert!(v.one_time_recipients.is_empty());
+        assert_eq!(v.total_fees_paid.0, NEAR / 2 / 200);
+    }
+
+    #[test]
+    fn fees_add_up_across_payments() {
+        let mut c = setup_with_fee(100);
+        pay(&mut c, agent(), shop(), NEAR / 2, T0);
+        pay(&mut c, agent(), shop(), NEAR / 2, T0 + 1);
+        assert_eq!(view(&c).total_fees_paid.0, 2 * (NEAR / 2 / 100));
+    }
+
+    // the callback for a payment with a fee: each transfer that bounces goes back
+
+    // In these four tests a payment of 0.5 NEAR carries a 0.5% fee of 0.0025 NEAR.
+
+    #[test]
+    fn both_transfers_succeeding_changes_nothing() {
+        let mut c = setup_with_fee(50);
+        let amount = NEAR / 2;
+        let fee = NEAR / 400;
+        pay(&mut c, agent(), shop(), amount, T0);
+        let ok = resolve_with_fee(
+            &mut c,
+            PromiseResult::Successful(vec![]),
+            PromiseResult::Successful(vec![]),
+            amount,
+            fee,
+        );
+        assert!(ok);
+        let v = view(&c);
+        assert_eq!(v.balance.0, 10 * NEAR - amount - fee);
+        assert_eq!(v.total_fees_paid.0, fee);
+        assert_eq!(v.spent_in_window.0, amount + fee);
+    }
+
+    #[test]
+    fn a_bounced_payment_is_refunded_but_the_fee_stays_paid() {
+        let mut c = setup_with_fee(50);
+        let amount = NEAR / 2;
+        let fee = NEAR / 400;
+        pay(&mut c, agent(), shop(), amount, T0);
+        let ok = resolve_with_fee(
+            &mut c,
+            PromiseResult::Failed,
+            PromiseResult::Successful(vec![]),
+            amount,
+            fee,
+        );
+        assert!(!ok);
+        let v = view(&c);
+        assert_eq!(v.balance.0, 10 * NEAR - fee);
+        assert_eq!(v.total_fees_paid.0, fee);
+        assert_eq!(v.spent_in_window.0, fee);
+    }
+
+    #[test]
+    fn a_bounced_fee_is_refunded_and_the_payment_stays_paid() {
+        let mut c = setup_with_fee(50);
+        let amount = NEAR / 2;
+        let fee = NEAR / 400;
+        pay(&mut c, agent(), shop(), amount, T0);
+        let ok = resolve_with_fee(
+            &mut c,
+            PromiseResult::Successful(vec![]),
+            PromiseResult::Failed,
+            amount,
+            fee,
+        );
+        assert!(ok);
+        let v = view(&c);
+        assert_eq!(v.balance.0, 10 * NEAR - amount);
+        assert_eq!(v.total_fees_paid.0, 0);
+        assert_eq!(v.spent_in_window.0, amount);
+    }
+
+    #[test]
+    fn if_both_bounce_everything_goes_back() {
+        let mut c = setup_with_fee(50);
+        let amount = NEAR / 2;
+        let fee = NEAR / 400;
+        pay(&mut c, agent(), shop(), amount, T0);
+        let ok = resolve_with_fee(
+            &mut c,
+            PromiseResult::Failed,
+            PromiseResult::Failed,
+            amount,
+            fee,
+        );
+        assert!(!ok);
+        let v = view(&c);
+        assert_eq!(v.balance.0, 10 * NEAR);
+        assert_eq!(v.total_fees_paid.0, 0);
+        assert_eq!(v.spent_in_window.0, 0);
     }
 }
