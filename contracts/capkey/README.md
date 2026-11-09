@@ -11,12 +11,13 @@ an agent with a normal wallet key can spend everything it holds. it can be promp
 ## how it works
 
 - the **owner** creates a vault, funds it with NEAR, and sets a policy: max per payment, max per 24 hours, a list of approved recipients, and an expiry time.
-- the **agent** is a separate near account. it gets a near **function call key** locked to this contract and the single method `execute_payment`. with that key it cannot do anything else on the network, and it cannot touch the owner's other funds.
-- every `execute_payment` call is checked by the contract against the policy. if any rule fails, the call panics and no money moves.
+- the **agent** is a separate near account. it gets a near **function call key** locked to this contract and two methods: `execute_payment` (NEAR) and `execute_ft_payment` (wNEAR). with that key it cannot do anything else on the network, and it cannot touch the owner's other funds.
+- every `execute_payment` and `execute_ft_payment` call is checked by the contract against the policy. if any rule fails, the call panics and no money moves.
 - the owner can `revoke_agent` (kill switch) and `withdraw` at any time, including after a revoke.
 - the approved list can change on the fly without restarting the daily limit: `add_recipient` adds a recipient for good, `approve_once` adds one that is removed after a single payment (for example a fresh swap deposit address), and `remove_recipient` takes one off. `set_policy` is the full reset and still restarts the daily window.
 - the owner can also set a fee (`set_fee`, at most 2%). the contract sends it to a treasury account inside every `execute_payment`, on top of the payment, so the agent cannot skip it.
 - if a transfer fails (for example the recipient account does not exist), a callback puts the money back in the vault and undoes the daily spend.
+- one token works next to NEAR: **wNEAR on testnet** (`wrap.testnet`, a NEP-141 token). the owner deposits it with `ft_transfer_call`, sets a separate cap and daily limit with `set_token_policy`, and the agent pays it out with `execute_ft_payment`. same rules as NEAR (approved recipients, expiry, revoke switch, fee, refund if the transfer fails), but wNEAR has its own balance, cap and daily window, so NEAR payments never use up the wNEAR limits and the other way round.
 
 ## methods
 
@@ -34,7 +35,11 @@ an agent with a normal wallet key can spend everything it holds. it can be promp
 | `revoke_agent()` | owner | stops the agent from spending and cancels unused one-time approvals |
 | `rotate_agent(new_agent)` | owner | replaces the agent and turns spending back on |
 | `withdraw(amount)` | owner | sends NEAR from the vault back to the owner |
-| `get_vault(owner)` (view) | anyone | shows balance, agent, policy, pending one-time recipients, fee (`fee_bps`, `fee_treasury`), `total_fees_paid`, revoked flag, spent today, remaining today |
+| `ft_on_transfer(sender_id, amount, msg)` | the token contract `wrap.testnet`, never you | credits a wNEAR deposit to the vault of the account that sent it. you trigger it by sending wNEAR with `ft_transfer_call` (see the notes on wNEAR). only `wrap.testnet` can call it, and only the sender's own vault is credited. if the sender has no vault, the whole amount is handed back |
+| `set_token_policy(per_tx_cap, daily_limit)` | owner | sets the wNEAR cap and daily limit (strings, 24 decimals like NEAR). does not touch the NEAR policy or the NEAR daily window, and restarts only the wNEAR daily window |
+| `execute_ft_payment(owner, recipient, amount)` | agent | the wNEAR version of `execute_payment`: pays wNEAR from the owner's vault if every rule passes. if a fee is set, it is sent in wNEAR in the same call |
+| `withdraw_token(amount)` | owner | sends wNEAR from the vault back to the owner. works any time, including after a revoke |
+| `get_vault(owner)` (view) | anyone | shows balance, agent, policy, pending one-time recipients, fee (`fee_bps`, `fee_treasury`), `total_fees_paid`, revoked flag, spent today, remaining today, and a `token` object with the wNEAR side (`token_id`, `balance`, `policy`, `spent_in_window`, `window_start`, `remaining_today`, `total_fees_paid`) |
 
 notes on the approved list:
 
@@ -52,13 +57,26 @@ notes on the fee:
 - the payment and the fee go out together. if one of the two transfers bounces (for example the account does not exist), only that one goes back to the vault and its daily spend is undone. `total_fees_paid` only counts fees that arrived.
 - a vault with no fee (the default) behaves exactly as it did before `set_fee` existed.
 
-payments are refused with a clear message: `agent has been revoked`, `policy has expired`, `recipient is not on the approved list`, `amount is over the per-transaction cap`, `payment would go over the daily limit`, `vault balance is too low`, `caller is not the agent for this vault`. changing the approved list can also be refused with: `recipient is already on the approved list`, `recipient already has a one-time approval`, `too many approved recipients (the limit is 20)`, `no policy set for this vault`. `set_fee` can be refused with: `fee is over the limit of 200 basis points (2%)`, `the fee treasury cannot be the vault contract itself`.
+notes on wNEAR:
+
+- **one token only.** the contract accepts wNEAR on testnet (`wrap.testnet`) and nothing else. a deposit from any other token contract is refused, and the token contract sends it back to the sender.
+- **deposit with `ft_transfer_call`**, called on `wrap.testnet` by the vault owner, with `receiver_id` set to the vault contract and an empty `msg`. 1 yoctoNEAR must be attached (that is how NEP-141 works). the contract credits the sender's own vault. a plain `ft_transfer` to the contract is **not** credited, so never use it.
+- **registration.** on `wrap.testnet` an account has to be registered (`storage_deposit`) before it can hold wNEAR. register the vault contract before the first deposit, and every recipient and the fee treasury before they are paid. if a recipient is not registered, the transfer fails and the refund path puts the amount back on the vault.
+- **separate limits.** `set_token_policy` sets the wNEAR cap and daily limit. wNEAR payments also need the NEAR policy (`set_policy`), because the approved list, the one-time approvals and the expiry are shared. a one-time approval is used up by the first accepted payment of either kind.
+- **same rules.** `execute_ft_payment` checks: caller is the agent, not revoked, policy not expired, recipient approved, amount above zero, fee on top, then the wNEAR cap, the wNEAR daily limit (24 hour window from the first wNEAR payment) and the wNEAR balance. the NEAR balance is never used for wNEAR payments.
+- **fee.** the fee set with `set_fee` applies to wNEAR payments too: `amount * bps / 10000` in wNEAR, rounded down, sent to the same treasury inside the same call, on top of the payment, counted toward the wNEAR cap, daily limit and balance. wNEAR fees are tracked in `token.total_fees_paid`, separate from the NEAR `total_fees_paid`.
+- **refund.** the callback `on_ft_payment_resolved` checks the transfer (and the fee transfer, if any). a failed one goes back on the wNEAR vault balance and its daily spend is undone, same as for NEAR. `withdraw_token` has the same protection: if the transfer fails, the amount goes back on the balance.
+- **gas.** each `ft_transfer` gets 15 Tgas and the callback 10 Tgas, so give the agent's `execute_ft_payment` call about 100 Tgas. the contract attaches the 1 yoctoNEAR that `ft_transfer` needs from its own account balance.
+- the agent's function call key must list both methods: `execute_payment,execute_ft_payment`.
+
+payments are refused with a clear message: `agent has been revoked`, `policy has expired`, `recipient is not on the approved list`, `amount is over the per-transaction cap`, `payment would go over the daily limit`, `vault balance is too low`, `caller is not the agent for this vault`. changing the approved list can also be refused with: `recipient is already on the approved list`, `recipient already has a one-time approval`, `too many approved recipients (the limit is 20)`, `no policy set for this vault`. `set_fee` can be refused with: `fee is over the limit of 200 basis points (2%)`, `the fee treasury cannot be the vault contract itself`. the wNEAR methods use the same messages (cap, daily limit, approved list, revoked, expired, caller) and add: `no token policy set for this vault`, `vault token balance is too low`, `only wNEAR (wrap.testnet) is accepted`, `amount is more than the vault token balance`.
 
 ## near tools used
 
-- function call keys (the agent's key is limited to `execute_payment` on this contract)
+- function call keys (the agent's key is limited to `execute_payment` and `execute_ft_payment` on this contract)
 - sub-accounts (separate accounts for the vault, the agent and the recipient)
-- promises and callbacks (transfer, then refund if it fails)
+- promises and callbacks (transfer, then refund if it fails; the payment and the fee run as two parallel promises joined into one callback)
+- fungible tokens (NEP-141): `ft_transfer_call` in, `ft_on_transfer` receiver, `ft_transfer` out, on `wrap.testnet`
 
 ## see the live result (read-only, no account needed)
 
@@ -78,7 +96,7 @@ what you need: rust (the repo pins version 1.93.0 in `rust-toolchain.toml`), the
 
 ### build and deploy
 
-note: `approve_once` and `set_fee` each added fields to the stored vault, so deploy this version to a **fresh account**. do not deploy it over a contract that already holds vaults from the first version, because those vaults could no longer be read.
+note: `approve_once`, `set_fee` and the wNEAR support each added fields to the stored vault, so deploy this version to a **fresh account**. do not deploy it over a contract that already holds vaults from the first version, because those vaults could no longer be read.
 
 1. build the contract (run this in `contracts/capkey`):
 
@@ -204,11 +222,13 @@ the agent's key can only call `execute_payment`. trying any other method with it
 
 ## tests
 
-`cargo test` runs 79 unit tests (run on linux), covering: vault creation and funding, an allowed payment, the per-payment cap, the approved list, the daily limit and its 24 hour reset, expiry, a missing policy, a low balance, revoke, withdraw after revoke, agent rotation, wrong caller, and the refund after a failed transfer. it also covers changing the approved list: adding, one-time approvals and removing recipients without restarting the daily window, the limit of 20 (permanent and one-time together), a one-time approval being used up once and not by a refused payment, and only the owner (never the agent) being able to change the list. it also covers the fee: the 2% maximum, owner-only, the fee counting toward the cap, the daily limit and the balance, rounding down, the fee going out in the same call as the payment, and a bounced payment or a bounced fee being refunded on its own. the first 21 behaviours were also checked live on testnet (steps 6 to 12 above); the approved-list methods and the fee are covered by the unit tests so far.
+`cargo test` runs 163 unit tests (run on linux): 79 for NEAR payments, the approved list and the fee, and 84 for wNEAR. the wNEAR tests cover: deposits (credited to the sender's own vault only, only `wrap.testnet` can credit, a sender without a vault gets the amount handed back, overflow), the wNEAR policy (owner-only, validations, separate from the NEAR policy and window both ways), `get_vault` keeping every old field with the `token` object added, payments (the `ft_transfer` receipt goes to `wrap.testnet` with the right receiver and amount and exactly 1 yoctoNEAR, no NEAR moves, every refusal: not the agent, revoked, no policy, no token policy, expired, unapproved recipient, zero, cap, daily limit, balance), the wNEAR daily window and its 24 hour reset, NEAR and wNEAR limits not affecting each other, one-time approvals, the fee on wNEAR (on top, counted toward the cap, daily limit and balance, rounding, two transfers in one call), refunds (payment bounced, fee bounced, both bounced, a late refund not touching a newer window, wrong result counts) and `withdraw_token` (owner-only, balance check, after revoke, bounce refund). the older 79 are described next. covering: vault creation and funding, an allowed payment, the per-payment cap, the approved list, the daily limit and its 24 hour reset, expiry, a missing policy, a low balance, revoke, withdraw after revoke, agent rotation, wrong caller, and the refund after a failed transfer. it also covers changing the approved list: adding, one-time approvals and removing recipients without restarting the daily window, the limit of 20 (permanent and one-time together), a one-time approval being used up once and not by a refused payment, and only the owner (never the agent) being able to change the list. it also covers the fee: the 2% maximum, owner-only, the fee counting toward the cap, the daily limit and the balance, rounding down, the fee going out in the same call as the payment, and a bounced payment or a bounced fee being refunded on its own. the first 21 behaviours were also checked live on testnet (steps 6 to 12 above); the approved-list methods and the fee are covered by the unit tests so far.
 
 ## not built yet
 
-- NEAR only. no USDC or other fungible tokens yet.
+- one token only: wNEAR on testnet (`wrap.testnet`). no USDC or other fungible tokens, and the token is fixed in the code (not a setting).
+- wNEAR sent to the contract with a plain `ft_transfer` (not `ft_transfer_call`) is not credited to any vault and cannot be recovered. always deposit with `ft_transfer_call`.
+- the contract does not register itself, recipients or the treasury on `wrap.testnet`. that is a one-time `storage_deposit` each (see the notes on wNEAR).
 - the contract account pays storage for new vaults. owners are not charged a storage deposit yet.
 - no abi file (skipped on windows with `--no-abi`).
 - no sandbox integration tests, only unit tests plus the live testnet run.
