@@ -80,15 +80,15 @@ payments are refused with a clear message: `agent has been revoked`, `policy has
 
 ## see the live result (read-only, no account needed)
 
-the contract is live on testnet at `vault.wavecapkey.testnet`. with [near-cli-rs](https://github.com/near/near-cli-rs) installed, anyone can read it, no account or keys needed:
+the current version (NEAR + wNEAR + fee) is live on testnet at `capkey-wnear.testnet`. with [near-cli-rs](https://github.com/near/near-cli-rs) installed, anyone can read it, no account or keys needed:
 
 1. run:
 
 ```
-near contract call-function as-read-only vault.wavecapkey.testnet get_vault json-args '{\"owner\":\"wavecapkey.testnet\"}' network-config testnet now
+near contract call-function as-read-only capkey-wnear.testnet get_vault json-args '{\"owner\":\"wnear-owner-wave.testnet\"}' network-config testnet now
 ```
 
-**see:** the vault of `wavecapkey.testnet` with `revoked: true`, `balance: "0"` and `spent_in_window` of 0.25 NEAR. this is the state left by the demo below. on windows powershell the backslashes before the quotes are needed. on mac or linux use plain quotes: `'{"owner":"wavecapkey.testnet"}'`.
+**see:** the vault of `wnear-owner-wave.testnet` with a NEAR `balance` of 0.899 NEAR, a 1% fee (`fee_bps: 100`), and a `token` block for wNEAR (`token_id: "wrap.testnet"`, `balance` 0.8493 wNEAR, its own cap and daily limit). this is the state left by the wNEAR demo below. on windows powershell the backslashes before the quotes are needed. on mac or linux use plain quotes: `'{"owner":"wnear-owner-wave.testnet"}'`.
 
 ## try it yourself (testnet)
 
@@ -218,11 +218,79 @@ near contract call-function as-transaction vault.wavecapkey.testnet withdraw jso
 
 ### extra check on the restricted key
 
-the agent's key can only call `execute_payment`. trying any other method with it, for example `create_vault`, is refused by the network before the contract runs: `Transaction method name <...> isn't allowed by the access key`.
+the agent's key can only call the methods it was created with (`execute_payment` and `execute_ft_payment`). trying any other method with it, for example `create_vault`, is refused by the network before the contract runs: `Transaction method name <...> isn't allowed by the access key`.
+
+### wNEAR demo (run live on testnet, 2026-11-10)
+
+this was run against `capkey-wnear.testnet` with the owner `wnear-owner-wave.testnet` and the agent `wnear-agent-wave.testnet` (all created with the faucet service). replace the names with yours. amounts are 24 decimals, so `1000000000000000000000000` is 1 wNEAR. the commands use the same `$f` variable as above for the agent's key file.
+
+13. **wrap some NEAR** (the owner gets wNEAR, and is registered on `wrap.testnet` automatically):
+
+```
+near contract call-function as-transaction wrap.testnet near_deposit json-args '{}' prepaid-gas '30 Tgas' attached-deposit '2 NEAR' sign-as wnear-owner-wave.testnet network-config testnet sign-with-keychain send
+```
+
+14. **register** the vault contract, the recipient and the fee treasury on `wrap.testnet` (repeat for each account, the unused part of the deposit is refunded):
+
+```
+near contract call-function as-transaction wrap.testnet storage_deposit json-args '{\"account_id\":\"capkey-wnear.testnet\",\"registration_only\":true}' prepaid-gas '30 Tgas' attached-deposit '0.01 NEAR' sign-as wnear-owner-wave.testnet network-config testnet sign-with-keychain send
+```
+
+15. **set up the vault**: `create_vault`, `set_policy` (the approved list and expiry, as in step 6), then the wNEAR limits (0.1 wNEAR per payment, 0.25 per day) and a 1% fee:
+
+```
+near contract call-function as-transaction capkey-wnear.testnet set_token_policy json-args '{\"per_tx_cap\":\"100000000000000000000000\",\"daily_limit\":\"250000000000000000000000\"}' prepaid-gas '30 Tgas' attached-deposit '0 NEAR' sign-as wnear-owner-wave.testnet network-config testnet sign-with-keychain send
+```
+
+```
+near contract call-function as-transaction capkey-wnear.testnet set_fee json-args '{\"bps\":100,\"treasury\":\"wavecapkey.testnet\"}' prepaid-gas '30 Tgas' attached-deposit '0 NEAR' sign-as wnear-owner-wave.testnet network-config testnet sign-with-keychain send
+```
+
+**see:** logs `token_policy_set` and `fee_set`.
+
+16. **deposit 1 wNEAR into the vault** with `ft_transfer_call` (1 yoctoNEAR attached):
+
+```
+near contract call-function as-transaction wrap.testnet ft_transfer_call json-args '{\"receiver_id\":\"capkey-wnear.testnet\",\"amount\":\"1000000000000000000000000\",\"msg\":\"\"}' prepaid-gas '100 Tgas' attached-deposit '1 yoctoNEAR' sign-as wnear-owner-wave.testnet network-config testnet sign-with-keychain send
+```
+
+**see:** log `token_deposit`, and `get_vault` shows `token.balance` of 1 wNEAR next to all the old fields.
+
+17. **give the agent a key for both methods** (add `execute_ft_payment` to the list from step 5):
+
+```
+near account add-key wnear-agent-wave.testnet grant-function-call-access --allowance '0.5 NEAR' --contract-account-id capkey-wnear.testnet --function-names 'execute_payment,execute_ft_payment' autogenerate-new-keypair --signature-scheme ed25519 save-to-legacy-keychain network-config testnet sign-with-keychain send
+```
+
+18. **allowed wNEAR payment.** the agent pays 0.05 wNEAR to the approved recipient, plus the 1% fee:
+
+```
+near contract call-function as-transaction capkey-wnear.testnet execute_ft_payment json-args '{\"owner\":\"wnear-owner-wave.testnet\",\"recipient\":\"capkey-vault3.testnet\",\"amount\":\"50000000000000000000000\"}' prepaid-gas '100 Tgas' attached-deposit '0 NEAR' sign-as wnear-agent-wave.testnet network-config testnet sign-with-access-key-file $f send
+```
+
+**see:** log `ft_payment_executed` with the fee, two `Transfer` lines from `wrap.testnet` (0.05 to the recipient, 0.0005 to the treasury), and return value `true`.
+
+19. **over the wNEAR cap.** the agent tries 0.2 wNEAR (the same call with `\"amount\":\"200000000000000000000000\"`):
+
+**see:** error `capkey: amount is over the per-transaction cap`. nothing moves.
+
+20. **failed transfer is refunded.** the owner approves a recipient that is not registered on `wrap.testnet` with `approve_once`, and the agent pays them 0.02 wNEAR:
+
+**see:** log `ft_transfer_failed_refunded` and return value `false`. `get_vault` then shows the wNEAR `balance` with the payment back on it (only the fee stayed paid) and `spent_in_window` counting just the fee.
+
+21. **owner takes wNEAR back:**
+
+```
+near contract call-function as-transaction capkey-wnear.testnet withdraw_token json-args '{\"amount\":\"100000000000000000000000\"}' prepaid-gas '100 Tgas' attached-deposit '0 NEAR' sign-as wnear-owner-wave.testnet network-config testnet sign-with-keychain send
+```
+
+**see:** log `token_withdrawn`, a `Transfer` line from `wrap.testnet`, return value `true`.
+
+22. **the NEAR side still works on the same contract.** `fund_vault` with 1 NEAR, then the agent pays 0.1 NEAR with `execute_payment`. `get_vault` shows the NEAR balance and fee totals changing while the `token` block stays the same.
 
 ## tests
 
-`cargo test` runs 163 unit tests (run on linux): 79 for NEAR payments, the approved list and the fee, and 84 for wNEAR. the wNEAR tests cover: deposits (credited to the sender's own vault only, only `wrap.testnet` can credit, a sender without a vault gets the amount handed back, overflow), the wNEAR policy (owner-only, validations, separate from the NEAR policy and window both ways), `get_vault` keeping every old field with the `token` object added, payments (the `ft_transfer` receipt goes to `wrap.testnet` with the right receiver and amount and exactly 1 yoctoNEAR, no NEAR moves, every refusal: not the agent, revoked, no policy, no token policy, expired, unapproved recipient, zero, cap, daily limit, balance), the wNEAR daily window and its 24 hour reset, NEAR and wNEAR limits not affecting each other, one-time approvals, the fee on wNEAR (on top, counted toward the cap, daily limit and balance, rounding, two transfers in one call), refunds (payment bounced, fee bounced, both bounced, a late refund not touching a newer window, wrong result counts) and `withdraw_token` (owner-only, balance check, after revoke, bounce refund). the older 79 are described next. covering: vault creation and funding, an allowed payment, the per-payment cap, the approved list, the daily limit and its 24 hour reset, expiry, a missing policy, a low balance, revoke, withdraw after revoke, agent rotation, wrong caller, and the refund after a failed transfer. it also covers changing the approved list: adding, one-time approvals and removing recipients without restarting the daily window, the limit of 20 (permanent and one-time together), a one-time approval being used up once and not by a refused payment, and only the owner (never the agent) being able to change the list. it also covers the fee: the 2% maximum, owner-only, the fee counting toward the cap, the daily limit and the balance, rounding down, the fee going out in the same call as the payment, and a bounced payment or a bounced fee being refunded on its own. the first 21 behaviours were also checked live on testnet (steps 6 to 12 above); the approved-list methods and the fee are covered by the unit tests so far.
+`cargo test` runs 163 unit tests (run on linux): 79 for NEAR payments, the approved list and the fee, and 84 for wNEAR. the wNEAR tests cover: deposits (credited to the sender's own vault only, only `wrap.testnet` can credit, a sender without a vault gets the amount handed back, overflow), the wNEAR policy (owner-only, validations, separate from the NEAR policy and window both ways), `get_vault` keeping every old field with the `token` object added, payments (the `ft_transfer` receipt goes to `wrap.testnet` with the right receiver and amount and exactly 1 yoctoNEAR, no NEAR moves, every refusal: not the agent, revoked, no policy, no token policy, expired, unapproved recipient, zero, cap, daily limit, balance), the wNEAR daily window and its 24 hour reset, NEAR and wNEAR limits not affecting each other, one-time approvals, the fee on wNEAR (on top, counted toward the cap, daily limit and balance, rounding, two transfers in one call), refunds (payment bounced, fee bounced, both bounced, a late refund not touching a newer window, wrong result counts) and `withdraw_token` (owner-only, balance check, after revoke, bounce refund). the older 79 are described next. covering: vault creation and funding, an allowed payment, the per-payment cap, the approved list, the daily limit and its 24 hour reset, expiry, a missing policy, a low balance, revoke, withdraw after revoke, agent rotation, wrong caller, and the refund after a failed transfer. it also covers changing the approved list: adding, one-time approvals and removing recipients without restarting the daily window, the limit of 20 (permanent and one-time together), a one-time approval being used up once and not by a refused payment, and only the owner (never the agent) being able to change the list. it also covers the fee: the 2% maximum, owner-only, the fee counting toward the cap, the daily limit and the balance, rounding down, the fee going out in the same call as the payment, and a bounced payment or a bounced fee being refunded on its own. the first 21 behaviours were also checked live on testnet (steps 6 to 12 above). on 2026-11-10 the new version was checked live on `capkey-wnear.testnet` (steps 13 to 22): a wNEAR deposit with `ft_transfer_call`, a wNEAR payment with the fee, the wNEAR cap refusal, the refund of a failed wNEAR transfer, `withdraw_token`, a one-time approval, and a NEAR payment with the fee on the same contract. the other behaviours are covered by the unit tests.
 
 ## not built yet
 
