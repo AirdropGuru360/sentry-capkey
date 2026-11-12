@@ -23,6 +23,8 @@ import {
   readReceipts,
 } from "./store.js";
 import { formatPayeesLines } from "./payees-status.js";
+import { serviceConfig, fetchPrice } from "./service.js";
+import { parseBuyCommand, buyState, onPaidCheck, buyReplyText } from "./buy.js";
 import path from "node:path";
 import os from "node:os";
 
@@ -64,6 +66,8 @@ if (treasury !== "" && !isValidAccountId(treasury)) {
   process.exit(1);
 }
 
+const { serviceUrl, serviceAccountId } = serviceConfig();
+
 console.log("Sentry starting");
 if (treasury === "") console.log("fee disabled");
 
@@ -92,6 +96,23 @@ function reloadPayees() {
 
 const bot = new Telegraf(botToken);
 
+// Log one line per incoming update: type, sender id, chat id, message text.
+// Never logs the token or any environment value.
+bot.use((ctx, next) => {
+  const type = ctx.updateType ?? "unknown";
+  const from = ctx.from?.id ?? "-";
+  const chat = ctx.chat?.id ?? "-";
+  const rawText = ctx.message?.text;
+  const text = typeof rawText === "string" ? rawText.replace(/\r?\n/g, "\\n") : "-";
+  console.log(`Update: type=${type} from=${from} chat=${chat} text=${text}`);
+  return next();
+});
+
+// Last-resort handler: log unhandled errors from any handler.
+bot.catch((err) => {
+  console.error("Unhandled handler error:", err?.stack ?? err);
+});
+
 // Owner-only gate. Runs before every handler, for commands and plain messages.
 // Non-owners get no reply and no further processing.
 bot.use((ctx, next) => {
@@ -116,6 +137,8 @@ const getAgent = () =>
 
 // Recipients paid successfully in this run. First-time payments get a warning.
 const paidBefore = new Set();
+// URL of the /buy check payment awaiting confirmation (set by /buy, consumed by onPaid).
+const buyPending = buyState();
 const selfIds = [vaultId, ownerAccount, readEnv("AGENT_ACCOUNT_ID"), treasury].filter(Boolean);
 
 async function assess({ recipient, amountYocto }) {
@@ -145,7 +168,7 @@ const payflow = createPayflow({
   assess,
   treasury: treasury || undefined,
   executePayment: bindExecutor({ getAgent, vaultId, ownerId: ownerAccount, executePayment }),
-  onPaid({ recipient, amountYocto, txHash, feeYocto, feeTxHash }) {
+  async onPaid({ recipient, amountYocto, txHash, feeYocto, feeTxHash }) {
     // Append a receipt. Never throws: failure is logged, not fatal.
     try {
       appendReceipt(getDataDir(), {
@@ -159,6 +182,16 @@ const payflow = createPayflow({
     } catch (err) {
       console.error("appendReceipt failed:", err?.message);
     }
+    // If this was a /buy check payment, verify it with the service now. The
+    // txHash comes from the successful payment. Never throws.
+    await onPaidCheck({
+      state: buyPending,
+      recipient,
+      txHash,
+      fetchFn: fetch,
+      serviceUrl,
+      serviceAccountId,
+    });
   },
 });
 
@@ -179,6 +212,33 @@ async function startPayment(ctx, payload) {
 
 bot.command("pay", (ctx) => startPayment(ctx, ctx.payload));
 
+// /buy check <https url> — pay the site-check service, then have it verify
+// the payment on-chain. Same payflow (risk check, confirm/cancel, vault rules).
+bot.command("buy", async (ctx) => {
+  const parsed = parseBuyCommand(`/buy ${ctx.payload ?? ""}`);
+  if (!parsed.ok) return ctx.reply(parsed.text);
+  if (serviceAccountId === "") {
+    return ctx.reply("Site check service is not configured: SERVICE_ACCOUNT_ID is empty.");
+  }
+  const price = await fetchPrice({ fetchFn: fetch, serviceUrl, serviceAccountId });
+  if (!price.ok) {
+    return ctx.reply(`Could not read the service price: ${price.reason}`);
+  }
+  const amount = formatNear(BigInt(price.priceYocto), 24).replace(/ NEAR$/, "");
+  const r = await payflow.request(`${amount} ${serviceAccountId}`);
+  if (!r.ok) return ctx.reply(r.text);
+  buyPending.url = parsed.url;
+  await ctx.reply(
+    r.text,
+    Markup.inlineKeyboard([
+      [
+        Markup.button.callback("Confirm", `confirm:${r.id}`),
+        Markup.button.callback("Cancel", `cancel:${r.id}`),
+      ],
+    ]),
+  );
+});
+
 // Plain-language mode, e.g. "pay shop 0.5". Rule-based; same payflow as /pay,
 // so the risk check, confirmation, expiry and vault rules all still apply.
 bot.on("text", async (ctx, next) => {
@@ -192,7 +252,20 @@ bot.on("text", async (ctx, next) => {
 bot.action(/^(confirm|cancel):([A-Za-z0-9-]{1,64})$/, async (ctx) => {
   const [, action, id] = ctx.match;
   await ctx.answerCbQuery();
-  const r = action === "confirm" ? await payflow.confirm(id) : payflow.cancel(id);
+  let r;
+  if (action === "confirm") r = await payflow.confirm(id);
+  else r = payflow.cancel(id);
+
+  // The site check for a /buy payment ran inside onPaid (above). Consume it once.
+  const check = buyPending.check;
+  buyPending.url = null;
+  buyPending.check = null;
+
+  if (action === "confirm" && r.ok && r.txHash && check) {
+    await ctx.reply(buyReplyText({ paid: r, check }));
+    return;
+  }
+
   if (r.ok && r.recipient) paidBefore.add(r.recipient);
   await ctx.reply(r.text);
 });
@@ -247,7 +320,7 @@ bot.command("status", async (ctx) => {
     lines.push(`One-time approvals: ${once.join(", ") || "none"}`);
     await ctx.reply(lines.join("\n"));
   } catch (err) {
-    console.error("/status failed:", err.message);
+    console.error("/status failed:", err.stack);
     await ctx.reply("Could not read the vault. Try again.");
   }
 });
