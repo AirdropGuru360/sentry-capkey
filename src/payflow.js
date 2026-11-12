@@ -9,14 +9,23 @@ import { FEE_BPS, computeFee } from "./fee.js";
 
 export const TTL_MS = 60_000;
 const USAGE =
-  "Usage: /pay <amount> <recipient>, e.g. /pay 0.5 shop.wavecapkey.testnet";
+  "Usage: /pay <amount> <recipient> [wnear|near], e.g. /pay 0.5 shop.wavecapkey.testnet wnear";
 
-// Accepts "/pay 0.5 shop.testnet" or a bare "0.5 shop.testnet".
-// Fails closed on anything unclear.
+// Accepts "/pay 0.5 shop.testnet" or a bare "0.5 shop.testnet", with an
+// optional trailing token word: "wnear" for wNEAR (wrap.testnet), "near" for
+// NEAR (the default). Fails closed on anything unclear.
 export function parsePayCommand(text) {
   const parts = String(text ?? "").trim().split(/\s+/).filter(Boolean);
   if (parts.length > 0 && /^\/pay(@\w+)?$/i.test(parts[0])) parts.shift();
-  if (parts.length !== 2) return { ok: false, text: USAGE };
+  if (parts.length < 2 || parts.length > 3) return { ok: false, text: USAGE };
+
+  let token;
+  if (parts.length === 3) {
+    const word = parts[2].toLowerCase();
+    if (word === "wnear") token = "wnear";
+    else if (word === "near") token = undefined;
+    else return { ok: false, text: `Unknown token "${parts[2]}". ${USAGE}` };
+  }
 
   const [rawAmount, recipient] = parts;
   let amountYocto;
@@ -28,12 +37,20 @@ export function parsePayCommand(text) {
   if (!isValidAccountId(recipient)) {
     return { ok: false, text: "Invalid recipient account ID." };
   }
-  return { ok: true, amountYocto, recipient };
+  return { ok: true, amountYocto, recipient, token };
 }
 
-// formatNear adds " NEAR"; the confirmation sentence adds it itself.
+// formatNear adds " NEAR"; the confirmation sentence adds the token itself.
 function nearText(amountYocto) {
   return formatNear(amountYocto, 24).replace(/ NEAR$/, "");
+}
+
+function tokenLabel(token) {
+  return token === "wnear" ? "wNEAR" : "NEAR";
+}
+
+function txLink(hash) {
+  return `https://explorer.testnet.near.org/transactions/${hash}`;
 }
 
 // Binds config and the account to the executor, so payflow stays config-free.
@@ -74,9 +91,9 @@ export function createPayflow({
   }
 
   // The risk check is injected. Any failure is a block: never pay "just in case".
-  async function safeAssess({ recipient, amountYocto }) {
+  async function safeAssess(entry) {
     try {
-      const risk = await assess({ recipient, amountYocto });
+      const risk = await assess(entry);
       const levels = ["ok", "warn", "block"];
       if (!risk || !levels.includes(risk.level) || !Array.isArray(risk.reasons)) {
         return { level: "block", reasons: ["risk check failed"] };
@@ -108,10 +125,11 @@ export function createPayflow({
     pending.set(id, {
       amountYocto: parsed.amountYocto,
       recipient: parsed.recipient,
+      token: parsed.token,
       expiresAt: now + ttlMs,
     });
 
-    let prompt = `Pay ${nearText(parsed.amountYocto)} NEAR to ${parsed.recipient}? Expires in ${Math.round(
+    let prompt = `Pay ${nearText(parsed.amountYocto)} ${tokenLabel(parsed.token)} to ${parsed.recipient}? Expires in ${Math.round(
       ttlMs / 1000,
     )} seconds.`;
     if (risk.level === "warn") {
@@ -123,7 +141,7 @@ export function createPayflow({
     } catch {
       fee = 0n; // the confirm step reports the fee error
     }
-    if (fee > 0n) prompt += `\nFee: ${formatNear(fee, 24)} to treasury.`;
+    if (fee > 0n) prompt += `\nFee: ${nearText(fee)} ${tokenLabel(parsed.token)} to treasury.`;
     return { ok: true, id, text: prompt };
   }
 
@@ -140,20 +158,22 @@ export function createPayflow({
       const risk = await safeAssess(entry);
       if (risk.level === "block") return { ok: false, text: blockText(risk.reasons) };
 
+      const payment = { recipient: entry.recipient, amountYocto: entry.amountYocto };
+      if (entry.token) payment.token = entry.token;
+
       let result;
       try {
         // Always the stored values, never anything from the button or a later message.
-        result = await executePayment({
-          recipient: entry.recipient,
-          amountYocto: entry.amountYocto,
-        });
+        result = await executePayment(payment);
       } catch {
         return { ok: false, text: "Payment failed." };
       }
-      if (!result?.ok) return { ok: false, text: result?.reason ?? "Payment failed." };
+      if (!result?.ok) {
+        const link = typeof result.txHash === "string" ? `\n${txLink(result.txHash)}` : "";
+        return { ok: false, text: `${result?.reason ?? "Payment failed."}${link}` };
+      }
 
-      const link = (hash) => `https://explorer.testnet.near.org/transactions/${hash}`;
-      const mainLink = link(result.txHash);
+      const mainLink = txLink(result.txHash);
 
       // After a successful main payment nothing may throw: a fee problem is
       // reported, never retried, and never undoes the payment.
@@ -176,6 +196,7 @@ export function createPayflow({
         await notifyPaid({
           recipient: entry.recipient,
           amountYocto: entry.amountYocto,
+          token: entry.token,
           txHash: result.txHash,
           feeYocto: 0n,
           feeTxHash: undefined,
@@ -193,6 +214,7 @@ export function createPayflow({
         const info = {
           recipient: entry.recipient,
           amountYocto: entry.amountYocto,
+          token: entry.token,
           txHash: result.txHash,
           feeYocto: 0n,
           feeTxHash: undefined,
@@ -211,12 +233,14 @@ export function createPayflow({
       // One attempt only: a failed fee is reported and never retried.
       let feeText;
       let feeTxHash;
+      const feePayment = { recipient: treasury, amountYocto: fee };
+      if (entry.token) feePayment.token = entry.token;
       try {
-        const feeResult = await executePayment({ recipient: treasury, amountYocto: fee });
+        const feeResult = await executePayment(feePayment);
         if (feeResult?.ok && typeof feeResult.txHash === "string") {
           collectedFees += fee;
           feeTxHash = feeResult.txHash;
-          feeText = `Fee: ${formatNear(fee, 24)} to treasury.\n${link(feeResult.txHash)}`;
+          feeText = `Fee: ${nearText(fee)} ${tokenLabel(entry.token)} to treasury.\n${txLink(feeResult.txHash)}`;
         } else {
           feeText = `Fee not collected: ${feeResult?.reason ?? "payment failed"}`;
         }
@@ -227,6 +251,7 @@ export function createPayflow({
       const finalInfo = {
         recipient: entry.recipient,
         amountYocto: entry.amountYocto,
+        token: entry.token,
         txHash: result.txHash,
         feeYocto: feeTxHash ? fee : 0n,
         feeTxHash,

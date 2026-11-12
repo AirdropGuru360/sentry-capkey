@@ -612,3 +612,120 @@ test("onPaid receives feeYocto 0n and no feeTxHash when the fee payment fails", 
   assert.equal(calls[0].feeYocto, 0n);
   assert.equal(calls[0].feeTxHash, undefined);
 });
+
+// ---------------------------------------------------------------------------
+// wNEAR token
+// ---------------------------------------------------------------------------
+
+test("parsePayCommand accepts wnear as the optional token", () => {
+  const r = parsePayCommand("/pay 0.5 shop.wavecapkey.testnet wnear");
+  assert.equal(r.ok, true);
+  assert.equal(r.token, "wnear");
+  assert.equal(r.amountYocto, 500000000000000000000000n);
+  assert.equal(r.recipient, "shop.wavecapkey.testnet");
+});
+
+test("parsePayCommand accepts near and case variations of the token", () => {
+  const near = parsePayCommand("/pay 0.5 shop.wavecapkey.testnet near");
+  assert.equal(near.ok, true);
+  assert.equal(near.token, undefined);
+
+  const wnear = parsePayCommand("/pay 0.5 shop.wavecapkey.testnet WNEAR");
+  assert.equal(wnear.ok, true);
+  assert.equal(wnear.token, "wnear");
+});
+
+test("parsePayCommand defaults to NEAR without a token word", () => {
+  const r = parsePayCommand("/pay 0.5 shop.wavecapkey.testnet");
+  assert.equal(r.ok, true);
+  assert.equal(r.token, undefined);
+});
+
+test("parsePayCommand rejects a non-NEAR token word", () => {
+  const r = parsePayCommand("/pay 0.5 shop.wavecapkey.testnet usdc");
+  assert.equal(r.ok, false);
+  assert.match(r.text, /token/);
+});
+
+test("parsePayCommand still rejects three parts that are not a token", () => {
+  const r = parsePayCommand("/pay 0.5 BAD NAME");
+  assert.equal(r.ok, false);
+  assert.match(r.text, /recipient/);
+});
+
+test("the confirm prompt names the token", async () => {
+  const { flow } = setup();
+  const r = await flow.request("/pay 0.5 shop.wavecapkey.testnet wnear");
+  assert.equal(r.ok, true);
+  assert.match(r.text, /Pay 0\.5 wNEAR to shop\.wavecapkey\.testnet\?/);
+});
+
+test("the fee line names the token", async () => {
+  const { flow } = setup({ treasury: "dave-treasury.testnet" });
+  const r = await flow.request("/pay 1 shop.wavecapkey.testnet wnear");
+  assert.equal(r.ok, true);
+  assert.match(r.text, /Fee: 0\.005 wNEAR to treasury\./);
+});
+
+test("a wNEAR confirm reaches the executor with the token", async () => {
+  const seen = [];
+  const flow = createPayflow({
+    clock: () => 1_000_000,
+    newId: () => "id-1",
+    assess: async () => ({ level: "ok", reasons: [] }),
+    executePayment: async (payment) => {
+      seen.push(payment);
+      return { ok: true, txHash: "HFT" };
+    },
+  });
+
+  const { id } = await flow.request("/pay 0.5 shop.wavecapkey.testnet wnear");
+  const r = await flow.confirm(id);
+
+  assert.equal(r.ok, true);
+  assert.match(r.text, /transactions\/HFT/);
+  assert.deepEqual(seen, [
+    {
+      recipient: "shop.wavecapkey.testnet",
+      amountYocto: 500000000000000000000000n,
+      token: "wnear",
+    },
+  ]);
+});
+
+test("a refunded wNEAR transfer shows the refund message with the tx link", async () => {
+  const { flow } = setup({
+    executePayment: async () => ({
+      ok: false,
+      reason: "transfer failed and was refunded",
+      txHash: "HREF",
+    }),
+  });
+
+  const { id } = await flow.request("/pay 0.5 shop.wavecapkey.testnet wnear");
+  const r = await flow.confirm(id);
+
+  assert.equal(r.ok, false);
+  assert.match(r.text, /transfer failed and was refunded/);
+  assert.match(r.text, /transactions\/HREF/);
+});
+
+test("the default NEAR path still sends no token", async () => {
+  const seen = [];
+  const flow = createPayflow({
+    clock: () => 1_000_000,
+    newId: () => "id-1",
+    assess: async () => ({ level: "ok", reasons: [] }),
+    executePayment: async (payment) => {
+      seen.push(payment);
+      return { ok: true, txHash: "HN" };
+    },
+  });
+
+  const { id, text } = await flow.request("/pay 0.5 shop.wavecapkey.testnet");
+  assert.match(text, /Pay 0\.5 NEAR to shop\.wavecapkey\.testnet\?/);
+  const r = await flow.confirm(id);
+
+  assert.equal(r.ok, true);
+  assert.deepEqual(seen, [{ recipient: "shop.wavecapkey.testnet", amountYocto: 500000000000000000000000n }]);
+});

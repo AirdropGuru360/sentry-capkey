@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { assessRecipient, levenshtein } from "../src/risk.js";
+import { assessRecipient, previewFee, previewPayment, levenshtein } from "../src/risk.js";
 
 const base = {
   recipient: "shop.wavecapkey.testnet",
@@ -146,6 +146,86 @@ test("fails closed when the check itself throws", () => {
     }
   }
   const r = run({ paidBefore: new Boom() });
+  assert.equal(r.level, "block");
+  assert.deepEqual(r.reasons, ["risk check failed"]);
+});
+
+// ---------------------------------------------------------------------------
+// previewFee: fee rounded up for previews
+// ---------------------------------------------------------------------------
+
+test("previewFee rounds the fee up so previews never understate the cost", () => {
+  assert.equal(previewFee(10n ** 24n, 50), 5n * 10n ** 21n); // exactly 0.5%
+  assert.equal(previewFee(1n, 50), 1n); // 0.005 yocto rounds up to 1 yocto
+  assert.equal(previewFee(1n, 200), 1n); // 0.02 yocto rounds up to 1 yocto
+  assert.equal(previewFee(3n, 50), 1n); // 0.015 yocto rounds up
+});
+
+test("previewFee validates its inputs", () => {
+  for (const bad of [previewFee.bind(null, 0n), previewFee.bind(null, -1n), previewFee.bind(null, 10n, 201)]) {
+    assert.throws(bad);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// previewPayment: vault cap / daily limit / balance preview
+// ---------------------------------------------------------------------------
+
+const previewBase = {
+  token: "wnear",
+  policy: { per_tx_cap: "2000000000000000000000000" }, // 2 wNEAR
+  amountYocto: 10n ** 24n, // 1 wNEAR
+  feeYocto: 5n * 10n ** 21n, // 0.005 wNEAR
+  balance: 10n ** 25n, // 10000 wNEAR
+  remainingToday: 10n ** 25n, // 10000 wNEAR remains today
+};
+
+const previewRun = (over = {}) => previewPayment({ ...previewBase, ...over });
+
+test("previewPayment is ok when amount plus fee fits cap, window and balance", () => {
+  const r = previewRun();
+  assert.equal(r.level, "ok");
+  assert.deepEqual(r.reasons, []);
+});
+
+test("previewPayment blocks when amount plus fee exceeds the per-payment cap", () => {
+  const r = previewRun({ amountYocto: 1999n * 10n ** 21n }); // 1.999 wNEAR, +fee > 2 wNEAR cap
+  assert.equal(r.level, "block");
+  assert.match(r.reasons.join(" "), /per-payment cap/);
+});
+
+test("previewPayment blocks on the fee alone when the amount is exactly the cap", () => {
+  const r = previewRun({ amountYocto: 2000n * 10n ** 21n }); // exactly 2 wNEAR == cap, fee pushes over
+  assert.equal(r.level, "block");
+  assert.match(r.reasons.join(" "), /per-payment cap/);
+});
+
+test("previewPayment blocks when nothing remains in today's window", () => {
+  const r = previewRun({ remainingToday: 0n });
+  assert.equal(r.level, "block");
+  assert.match(r.reasons.join(" "), /remaining today/);
+});
+
+test("previewPayment blocks when the vault balance is too low", () => {
+  const r = previewRun({ balance: 0n });
+  assert.equal(r.level, "block");
+  assert.match(r.reasons.join(" "), /balance is too low/);
+});
+
+test("previewPayment blocks when the token policy is null", () => {
+  const r = previewPayment({ ...previewBase, policy: null });
+  assert.equal(r.level, "block");
+  assert.match(r.reasons.join(" "), /wNEAR policy/);
+});
+
+test("previewPayment names NEAR when the token is NEAR", () => {
+  const r = previewPayment({ ...previewBase, token: "near", policy: null });
+  assert.equal(r.level, "block");
+  assert.match(r.reasons.join(" "), /NEAR policy/);
+});
+
+test("previewPayment fails closed on bad input", () => {
+  const r = previewPayment({ ...previewBase, amountYocto: 0n });
   assert.equal(r.level, "block");
   assert.deepEqual(r.reasons, ["risk check failed"]);
 });

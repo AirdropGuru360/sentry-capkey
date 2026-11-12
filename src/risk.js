@@ -2,9 +2,51 @@
 // Fails closed: bad input or any thrown error becomes a block.
 
 import { isValidAccountId } from "./amount.js";
+import { computeFeeCeil } from "./fee.js";
 
 const HEX64 = /^[0-9a-f]{64}$/;
 const FAILED = "risk check failed";
+
+// Ceiling fee for previews: round up so the preview never understates the cost.
+export function previewFee(amountYocto, bps = 50) {
+  return computeFeeCeil(amountYocto, bps);
+}
+
+// Pure policy preview: amount + fee versus this token's per-payment cap,
+// today's remaining limit and the vault balance. Only hard limits block;
+// nothing here warns, and nothing mutates state. Fails closed on bad input.
+// `policy` is the token's policy object ({ per_tx_cap, ... }) or null.
+export function previewPayment({ token = "near", policy, amountYocto, feeYocto, balance, remainingToday }) {
+  try {
+    const inputsOk =
+      typeof amountYocto === "bigint" &&
+      typeof feeYocto === "bigint" &&
+      typeof remainingToday === "bigint" &&
+      typeof balance === "bigint" &&
+      amountYocto > 0n &&
+      feeYocto >= 0n &&
+      remainingToday >= 0n &&
+      balance >= 0n;
+    if (!inputsOk) return block([FAILED]);
+
+    if (!policy) {
+      return block([`No ${token === "wnear" ? "wNEAR" : "NEAR"} policy set for this vault.`]);
+    }
+    if (typeof policy.per_tx_cap !== "bigint" && typeof policy.per_tx_cap !== "string") {
+      return block([FAILED]);
+    }
+    const perTxCap = BigInt(policy.per_tx_cap);
+
+    const total = amountYocto + feeYocto;
+    if (total > perTxCap) return block(["This payment plus the fee exceeds the per-payment cap."]);
+    if (total > remainingToday)
+      return block(["This payment plus the fee exceeds the remaining today limit."]);
+    if (total > balance) return block(["The vault balance is too low for this payment plus the fee."]);
+    return { level: "ok", reasons: [] };
+  } catch {
+    return block([FAILED]);
+  }
+}
 
 // Levenshtein distance, two rows, no dependencies.
 export function levenshtein(a, b) {
