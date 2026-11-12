@@ -8,6 +8,7 @@ const UNREADABLE = "I can't read that. Use /pay <amount> <recipient>.";
 // A recipient must look like an account: an alias, a dotted name, or an implicit
 // 64-character hex account. Plain words are never treated as recipients.
 const HEX64 = /^[0-9a-f]{64}$/;
+const TOKEN_WORDS = new Set(["wnear", "near"]);
 
 function unreadable() {
   return { ok: false, reason: UNREADABLE };
@@ -40,11 +41,16 @@ export function proposeFromText(text, { aliases } = {}) {
 
     const amounts = [];
     const recipients = [];
+    let token; // "wnear" or undefined (NEAR is the default)
 
-    for (const token of tokens) {
+    for (const tok of tokens) {
+      if (TOKEN_WORDS.has(tok)) {
+        token = tok === "wnear" ? "wnear" : undefined;
+        continue;
+      }
       let yocto = null;
       try {
-        yocto = parseNear(token);
+        yocto = parseNear(tok);
       } catch {
         yocto = null;
       }
@@ -52,16 +58,16 @@ export function proposeFromText(text, { aliases } = {}) {
         amounts.push(yocto);
         continue;
       }
-      if (aliasMap.has(token)) {
-        recipients.push(aliasMap.get(token));
-      } else if (isValidAccountId(token) && (token.includes(".") || HEX64.test(token))) {
-        recipients.push(token);
+      if (aliasMap.has(tok)) {
+        recipients.push(aliasMap.get(tok));
+      } else if (isValidAccountId(tok) && (tok.includes(".") || HEX64.test(tok))) {
+        recipients.push(tok);
       }
     }
 
     if (amounts.length !== 1 || recipients.length !== 1) return unreadable();
 
-    return { ok: true, amountYocto: amounts[0], recipient: recipients[0] };
+    return { ok: true, amountYocto: amounts[0], recipient: recipients[0], token };
   } catch {
     return unreadable();
   }

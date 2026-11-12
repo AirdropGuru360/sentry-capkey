@@ -7,9 +7,10 @@ import { isOwner, parseOwnerId } from "./owner.js";
 import { getVault } from "./vault.js";
 import { formatNear } from "./format.js";
 import { isValidAccountId, parseNear } from "./amount.js";
+import { FEE_BPS, computeFeeCeil } from "./fee.js";
 import { createAgentAccount, executePayment } from "./pay.js";
 import { bindExecutor, createPayflow } from "./payflow.js";
-import { assessRecipient } from "./risk.js";
+import { assessRecipient, previewPayment } from "./risk.js";
 import { BLOCKLIST } from "./blocklist.js";
 import { getDryQuote } from "./intents.js";
 import { proposeFromText } from "./propose.js";
@@ -141,19 +142,40 @@ const paidBefore = new Set();
 const buyPending = buyState();
 const selfIds = [vaultId, ownerAccount, readEnv("AGENT_ACCOUNT_ID"), treasury].filter(Boolean);
 
-async function assess({ recipient, amountYocto }) {
+// Risk check plus a preview of the vault's own caps. NEAR keeps its exact
+// current behavior; wNEAR is previewed against token.policy, token.balance
+// and token.remaining_today, with the fee rounded up.
+async function assess({ recipient, amountYocto, token = "near" }) {
   try {
     const vault = await getVault(vaultId, ownerAccount);
-    if (!vault.policy) return { level: "block", reasons: ["risk check failed"] };
+    if (token === "wnear") {
+      const tokenInfo = vault.token;
+      if (!tokenInfo) {
+        return { level: "block", reasons: ["No wNEAR policy set for this vault."] };
+      }
+      const fee = computeFeeCeil(amountYocto, FEE_BPS);
+      const preview = previewPayment({
+        token: "wnear",
+        policy: tokenInfo.policy,
+        amountYocto,
+        feeYocto: fee,
+        balance: BigInt(tokenInfo.balance),
+        remainingToday: BigInt(tokenInfo.remaining_today),
+      });
+      if (preview.level === "block") return preview;
+    } else if (!vault.policy) {
+      return { level: "block", reasons: ["risk check failed"] };
+    }
+    const policy = token === "wnear" ? vault.token.policy : vault.policy;
     const approved = [
-      ...(vault.policy.allowed_recipients ?? []),
-      ...(vault.one_time_recipients ?? []),
+      ...(policy.allowed_recipients ?? []),
+      ...(policy.one_time_recipients ?? []),
     ];
     return assessRecipient({
       recipient,
       amountYocto,
       approved,
-      perTxCap: BigInt(vault.policy.per_tx_cap),
+      perTxCap: BigInt(policy.per_tx_cap),
       selfIds,
       blocklist: BLOCKLIST,
       paidBefore,
@@ -168,13 +190,14 @@ const payflow = createPayflow({
   assess,
   treasury: treasury || undefined,
   executePayment: bindExecutor({ getAgent, vaultId, ownerId: ownerAccount, executePayment }),
-  async onPaid({ recipient, amountYocto, txHash, feeYocto, feeTxHash }) {
+  async onPaid({ recipient, amountYocto, token, txHash, feeYocto, feeTxHash }) {
     // Append a receipt. Never throws: failure is logged, not fatal.
     try {
       appendReceipt(getDataDir(), {
         t: new Date().toISOString(),
         recipient,
         amountYocto: amountYocto.toString(),
+        token: token === "wnear" ? "wnear" : "near",
         txHash,
         feeYocto: feeYocto.toString(),
         feeTxHash: feeTxHash ?? null,
@@ -246,7 +269,8 @@ bot.on("text", async (ctx, next) => {
   const p = proposeFromText(ctx.message.text, { aliases: { ...ALIASES, ...payees } });
   if (!p.ok) return ctx.reply(p.reason);
   const amount = formatNear(p.amountYocto, 24).replace(/ NEAR$/, "");
-  return startPayment(ctx, `${amount} ${p.recipient}`);
+  const payload = p.token === "wnear" ? `${amount} ${p.recipient} wnear` : `${amount} ${p.recipient}`;
+  return startPayment(ctx, payload);
 });
 
 bot.action(/^(confirm|cancel):([A-Za-z0-9-]{1,64})$/, async (ctx) => {
@@ -307,6 +331,19 @@ bot.command("status", async (ctx) => {
       `Spent today: ${formatNear(v.spent_in_window)}`,
       `Remaining today: ${formatNear(v.remaining_today)}`,
     ];
+    if (v.token) {
+      lines.push(`wNEAR balance: ${formatNear(v.token.balance)}`);
+      if (v.token.policy) {
+        lines.push(
+          `wNEAR max per payment: ${formatNear(v.token.policy.per_tx_cap)}`,
+          `wNEAR daily limit: ${formatNear(v.token.policy.daily_limit)}`,
+          `wNEAR remaining today: ${formatNear(v.token.remaining_today)}`,
+        );
+      } else {
+        lines.push("wNEAR policy: not set");
+      }
+      lines.push(`wNEAR fees paid: ${formatNear(BigInt(v.token.total_fees_paid ?? 0))}`);
+    }
     if (v.policy) {
       lines.push(
         `Max per payment: ${formatNear(v.policy.per_tx_cap)}`,
@@ -391,7 +428,11 @@ bot.command("receipts", (ctx) => {
   const lines = list.map((r) => {
     const date = r.t ?? "?";
     const amount = (() => {
-      try { return formatNear(BigInt(r.amountYocto)); } catch { return String(r.amountYocto ?? "?"); }
+      try {
+        let formatted = formatNear(BigInt(r.amountYocto));
+        if (r.token === "wnear") formatted = formatted.replace(/ NEAR$/, " wNEAR");
+        return formatted;
+      } catch { return String(r.amountYocto ?? "?"); }
     })();
     const recipient = r.recipient ?? "?";
     const payeeName = nameOf[recipient];
