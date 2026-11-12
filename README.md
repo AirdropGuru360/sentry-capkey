@@ -34,20 +34,20 @@ You (Telegram)
 | Rule-based risk check: blocklist, lookalike names, own accounts, first-payment and large-amount warnings | Built |
 | `/quote`: live NEAR Intents price check | Built, dry quote only |
 | Plain-language requests ("pay shop 0.5"), read by simple rules, not an LLM | Built |
-| Bot-level fee (0.5%) to a treasury account, and `/treasury` | Built, tested live on testnet |
-| Contract-level fee (teammate): `set_fee`, fee taken inside `execute_payment`, 79 unit tests | Written and unit-tested. Not deployed or used by the bot yet |
+| Bot-level fee (0.5%) to a treasury account, and `/treasury` | Built; off unless `TREASURY_ACCOUNT_ID` is set |
+| Contract-level fee (teammate): `set_fee`, fee taken inside `execute_payment` | Deployed on capkey-vault3.testnet; takes 50 bps to dave-treasury.testnet in the same call |
 | LLM parsing, token (stablecoin) payments, real Intents swap | Not built |
 
 ## Track fit
 
-| Track | What exists today | What is still missing |
-|---|---|---|
-| AI Security & Defense | Locked function call key, on-chain spending rules, kill switch, risk check, owner-only bot | AI in the loop |
-| Agent Economy | The agent is its own NEAR account with its own key, pays only inside its budget, and each payment earns a fee for the treasury | The agent paying for services |
-| Open Innovation | A cross-chain safety layer: on-chain rules, risk check and a live Intents price check | A real cross-chain swap |
-| Unstoppable DeFi | A live NEAR Intents quote (dry only) | Real swaps (needs token support in the vault, and a mainnet vault) |
-| Autonomous Business | A 0.5% fee on each payment goes to a treasury account, shown with `/treasury` | Today the bot takes the fee as a second vault payment. A contract-level fee is written and unit-tested in the teammate's code, but it is not deployed or used by the bot yet |
-| Real-World Money | NEAR payments to approved recipients | Stablecoin payments |
+| Track | Status |
+|---|---|
+| Track 4 Autonomous Business | BUILT. The vault contract takes a 50 bps fee on every payment to dave-treasury.testnet in the same call (capkey-vault3.testnet, contract by teammate Wave); the bot's own fee is off. Evidence: payment tx AmHkp6gjeY2vHFdiqL5QkXZJyS4Z3kDnprkuuxsnCkw1. |
+| Track 7 Agent Economy | BUILT. `/buy check <https url>`: the agent pays dave-service.testnet 0.01 NEAR through the vault (same confirm, risk check, caps, kill switch), and service/ verifies the payment on-chain (signer, receiver, amount, success) before returning a site report; each tx hash works once. Evidence: tx 6VfRL7k8Ui9K6ZxQ6zqh5q27AJw1YVgXS4QKMk2ALSFt. |
+| Track 13 Open Innovation | BUILT. `src/guard.js` (`createGuardedPayer`), `examples/any-agent.js` (`DRY_RUN=1` runs with no secrets), `docs/INTEGRATE.md`. |
+| Track 6 Security | Built into the code: rule-based risk check (blocklist, lookalike names, own accounts), owner-only Telegram gate, spending caps (per-payment and daily), locked function-call key limited to `execute_payment`, and instant revoke/rotate. There is no LLM in the loop. |
+| Track 8 Real-World Money | PARTIAL. Payee book, vault approval status and `/receipts` exist. Stablecoin and token payments are NOT built. |
+| Track 1 Unstoppable DeFi | NOT BUILT beyond a read-only quote. `/quote` is a live NEAR Intents price check marked dry-only; no swap is executed. |
 
 ## Try it in two minutes (no setup, read-only)
 
@@ -92,14 +92,30 @@ Messages to send and what you should see:
 
 Kill switch: the owner calls `revoke_agent` on the vault. Every later payment fails with "agent has been revoked".
 
-## Run your own copy
+## How to run
+
+### Bot
 
 1. Create a Telegram bot with @BotFather.
-2. Create a NEAR testnet owner and agent account, create a vault with `create_vault`, fund it, and set a policy with `set_policy`. Give the agent a function call key limited to `execute_payment` on the vault.
-3. Copy `.env.example` to a file **outside the repo** and fill it in: bot token, your Telegram user id, vault, owner and agent account ids, the path to the agent key file, and a refund address for quotes.
+2. Create NEAR testnet owner and agent accounts, create a vault with `create_vault`, fund it, and set a policy with `set_policy`. Give the agent a function call key limited to `execute_payment` on the vault.
+3. Copy `.env.example` to a file **outside the repo** and fill it in: `TELEGRAM_BOT_TOKEN`, `OWNER_TELEGRAM_ID`, `VAULT_CONTRACT_ID`, `OWNER_ACCOUNT_ID`, `AGENT_ACCOUNT_ID`, `AGENT_KEY_FILE`, `NEAR_RPC_URL`, `INTENTS_REFUND_TO`, `TREASURY_ACCOUNT_ID`.
 4. `node --env-file=/path/to/your.env src/index.js`
 
 Never commit the token or the key file.
+
+### Site-check service (`service/`)
+
+Runs locally and binds to 127.0.0.1 only. Required env variables: `SERVICE_ACCOUNT_ID`, `SERVICE_PRICE_YOCTO`, `RPC_URL`, `PAYER_ACCOUNT_ID`. Optional: `SERVICE_PORT` (default 8787), `SERVICE_DATA_DIR`.
+
+```
+node service/server.js
+```
+
+### Dry-run example (no secrets, no network)
+
+```
+DRY_RUN=1 node examples/any-agent.js
+```
 
 ## Safety design
 
@@ -117,18 +133,14 @@ Never commit the token or the key file.
 - The risk check is rule-based. No outside risk API is used.
 - The "first payment" memory resets when the bot restarts.
 - Plain-language requests are read by simple rules, not an LLM.
-- The fee is a second vault payment after the main one. It counts toward the daily limit, and the two payments are not atomic. A contract-level fee is written and unit-tested, but not deployed or wired into the bot yet.
+- The contract-level fee (teammate's contract, capkey-vault3.testnet) takes 50 bps to dave-treasury.testnet in the same call; the bot's own 0.5% fee is off unless `TREASURY_ACCOUNT_ID` is set. The bot's fee is a second vault payment after the main one, counts toward the daily limit, and the two payments are not atomic.
 
-## Prior work and AI disclosure
+## AI disclosure
 
-- The vault contract is the teammate's work. It was written on the `capkey-near` branch in the hackathon window (the rules allow code from Oct 19). An earlier Solana prototype of the same idea exists separately and is not part of this repo.
-- The bot, tests, risk check and Intents quote were written during the hackathon.
-- AI assistance: the whole project was built with AI help, and every file was reviewed and tested by its author.
-  - What was ours: choosing the project and the tracks, deciding what to build and in what order, approving each design, running and testing everything live on testnet, and fixing the problems the reviews found.
-  - What the AI did: most of the code, plus design suggestions and code reviews (Claude).
-  - Written by OpenCode (model: DeepSeek V4.1 Flash): `src/owner.js`, `src/payflow.js`, `src/risk.js`, `src/blocklist.js`, `src/intents.js`, `src/propose.js`, `src/aliases.js`, `src/fee.js`, `src/treasury.js`, `package.json`, `.env.example`, and the tests for those files. `src/index.js` was started by OpenCode and then extended; the `/status` part came from Claude's snippets.
-  - Written with Claude (Anthropic): `src/vault.js`, `src/format.js`, `src/amount.js`, `src/pay.js` and their tests, plus the design, security reviews, the `AGENTS.md` brief and this README.
-  - Contract (the teammate's account): written with Claude (Anthropic) in chat, step by step: `contracts/capkey/src/lib.rs`, its 51 unit tests and the contract README. The teammate chose the idea and the rules, ran every command, built, deployed, live-tested and pushed it. The idea and the test list come from an earlier Solana prototype of the teammate's; the teammate states that no code was reused from it.
+- Code written with OpenCode using DeepSeek V4 Flash (free) and Nemotron 3.5 Super (free).
+- Planning, prompts and review help from Claude (Anthropic).
+- The vault contract (`contracts/`) was written by my teammate Wave; I did not edit it.
+- All code in this repo was run and tested by me: `node --test` reports 219 tests pass, 0 fail.
 
 ## Team
 
