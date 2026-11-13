@@ -3,7 +3,7 @@
 A spending-limit vault for AI agents on NEAR, with a Telegram bot in front of it.
 The owner sets the rules on-chain. The agent can only spend inside them. One call kills it.
 
-Built for NEAR HACKATHON (Nov 2026). Main track: AI Security & Defense. Also entered: Agent Economy, Unstoppable DeFi, Autonomous Business, Real-World Money and Open Innovation. The "Track fit" section below says plainly what each track has today.
+Built for NEAR HACKATHON (Nov 2026). Main track: AI Security & Defense. Also entered: Agent Economy, Autonomous Business, Real-World Money and Open Innovation. The "Track fit" section below says plainly what each track has today.
 
 Demo video: [link]  |  Demo post on X: [link]
 
